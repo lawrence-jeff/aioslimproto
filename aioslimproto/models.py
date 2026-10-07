@@ -226,6 +226,14 @@ PLAYMODE_MAP = {
 }
 
 
+# models.py patch v1
+# Adds bitrate/samplerate/samplesize to MediaMetadata (see below). Local
+# patch marker for this project - not an upstream aioslimproto version.
+# Bump this comment (v2, v3, ...) on any further change to this file so
+# a diff against a fresh pip download always shows what's actually been
+# touched, same convention as browselibrary.py's own version marker.
+
+
 class MediaMetadata(TypedDict):
     """Optional metadata for playback."""
 
@@ -235,6 +243,25 @@ class MediaMetadata(TypedDict):
     title: str  # optional
     image_url: str  # optional
     duration: int  # optional
+    # Added: real playback format info for the Now Playing screen's
+    # "<rate>Hz / <bits> bits" display. Previously these values never
+    # existed anywhere in MediaMetadata at all, so cli.py's
+    # playlist_item_from_media_details() had nothing to read and
+    # hardcoded "" for all three unconditionally - real LMS shows real
+    # format info here, MA-sourced tracks showed a blank template.
+    # Names match PlaylistItem's field names exactly (the TypedDict
+    # these values ultimately flow into for the JSON-RPC status
+    # response) rather than MA's own AudioFormat attribute names
+    # (sample_rate/bit_depth), since this dict's job is to carry values
+    # toward the wire format, not toward MA's internal model.
+    # Not yet populated by any caller as of this patch - see
+    # cli.py's matching patch, which reads these via .get() and falls
+    # back to "" (today's behavior) when a caller doesn't set them, so
+    # this is additive-only and doesn't change behavior for any
+    # existing MediaMetadata producer.
+    bitrate: str  # optional
+    samplerate: str  # optional
+    samplesize: str  # optional
 
 
 @dataclass

@@ -156,6 +156,13 @@ class SlimProtoCLI:
     _periodic_task: asyncio.Task | None = None
     _cli_server: asyncio.Server | None = None
     command_handler: SlimCLICommandHandler | None = None
+    # Set by the provider after construction. Returns MA's display_name for a
+    # player_id, or None if MA doesn't know that player. Independent of
+    # command_handler so the name works without the browse feature.
+    display_name_lookup: Callable[[str], str | None] | None = None
+    # Set by the provider after construction. The Music Assistant instance used
+    # for seek and play. Independent of command_handler so these work without browse.
+    mass: Any | None = None
 
     def __init__(
         self,
@@ -163,6 +170,7 @@ class SlimProtoCLI:
         cli_port: int | None = None,
         cli_port_json: int | None = 0,
         command_handler: SlimCLICommandHandler | None = None,
+        extra_routes: dict[str, Callable] | None = None,
     ) -> None:
         """
         Initialize Telnet and/or Json interface CLI.
@@ -174,6 +182,7 @@ class SlimProtoCLI:
         self.cli_port_json = cli_port_json
         self.logger = server.logger.getChild("cli")
         self.command_handler = command_handler
+        self.extra_routes = extra_routes or {}
         self._cometd_clients: dict[str, CometDClient] = {}
         self._player_map: dict[str, str] = {}
         self._apprunner: web.AppRunner | None = None
@@ -212,6 +221,8 @@ class SlimProtoCLI:
                 self._handle_jsonrpc_client,
             )
             self._webapp.router.add_route("*", "/cometd", self._handle_cometd_client)
+            for path, handler in self.extra_routes.items():
+                self._webapp.router.add_route("*", path, handler)
             await self._apprunner.setup()
             # set host to None to bind to all addresses on both IPv4 and IPv6
             self._tcp_site = web.TCPSite(
@@ -812,7 +823,6 @@ class SlimProtoCLI:
         except NotImplementedError:
             self._publish_unhandled_command(slim_command)
             return None
-
         if cmd_result is None:
             return {}
         if isinstance(cmd_result, (dict, list)):
@@ -838,8 +848,85 @@ class SlimProtoCLI:
                 continue
             if len(players) >= limit:
                 break
-            players.append(create_player_item(index, player))
+            item = create_player_item(index, player)
+            item["name"] = self._display_name(player)
+            players.append(item)
         return PlayersResponse(count=len(players), players_loop=players)
+
+    def _display_name(self, player: SlimClient) -> str:
+        """Real player name to show on the device's own screen and in.
+
+        serverstatus/players_loop - prefers Music Assistant's own
+        display_name (player.name if the user set a custom one via MA's
+        own UI, else MA's own stored default_name, else the bare
+        player_id - MA's own real display_name property, confirmed via
+        its own source: "always prefer the custom name over the default
+        name") over player.name here (aioslimproto's own SlimClient
+        property, confirmed via its own source to be read-only and
+        sourced purely from the device's own self-reported name at
+        handshake, with no override mechanism of any kind - this
+        project implements no "name" CLI command either, the real
+        mechanism real LMS's own "Squeezebox Name" settings item uses
+        to push a persistent override down to a player). A real device
+        test confirmed the actual, user-visible consequence: renaming a
+        player via MA's own UI had no effect on what the device itself
+        displayed, even across a reboot - because nothing in this
+        project ever read that renamed value in the first place.
+        Falls back to aioslimproto's own player.name when this player
+        isn't resolvable as a real MA player object (e.g. a sync-group
+        member not individually registered) - same value as before,
+        never worse than today's behavior.
+        """
+        if self.display_name_lookup is not None:
+            name = self.display_name_lookup(player.player_id)
+            if name:
+                return name
+        return player.name
+
+    @staticmethod
+    def _corrected_elapsed_seconds(player: SlimClient) -> float:
+        """Real, stream-relative player.elapsed_seconds corrected for a.
+
+        seeked stream's own position-0 restart. Confirmed via a real
+        device test and PlayerMedia's own field comment (music_assistant_
+        models/player.py: "length of the audio stream as delivered to
+        the player, differs from duration after a seek on transports
+        whose stream restarts at position zero" - exactly this
+        project's own situation): after a seek, aioslimproto's own
+        elapsed_seconds reports position within the NEW, shorter stream
+        (0-based from the seek point), not position within the real
+        track - the audio itself was already correct, but every
+        elapsed-time value reported to the client needs this same
+        correction, or the displayed progress bar/time resets to 0:00
+        and counts up from there instead of showing the real position.
+        player.current_media.metadata's own "elapsed_offset" (set in
+        player.py's play_media(), alongside this same real field) is
+        exactly that correction - how many seconds into the track the
+        current stream's own position 0 actually corresponds to (0 when
+        no seek has happened yet, since duration == stream_duration
+        then).
+
+        Guarded to PlayerState.STOPPED (real, confirmed value -
+        models.py's own PLAYMODE_MAP) - returns a flat 0, confirmed
+        correct by direct testing against real LMS hardware (a real
+        device test found it resets to 0 once a track finishes, not
+        the clamped end-of-track value StreamingController.pm's own
+        playingSongElapsed() seemed to suggest - that source reading
+        either doesn't apply to this exact scenario or missed something
+        a different code path handles; direct hardware testing wins
+        here). Two earlier, wrong guesses in this same spot: first
+        returning player.elapsed_seconds directly for the stopped case
+        (found frozen at a stale, seek-relative position, e.g. 11s),
+        then briefly showing the clamped duration instead (real per
+        source, but disproven by direct testing against real LMS
+        itself) before settling on this flat 0.
+        """
+        if player.state == PlayerState.STOPPED:
+            return 0
+        offset = 0
+        if player.current_media and player.current_media.metadata:
+            offset = player.current_media.metadata.get("elapsed_offset", 0) or 0
+        return player.elapsed_seconds + offset
 
     async def _handle_status(
         self,
@@ -862,36 +949,117 @@ class SlimProtoCLI:
             playlist_items.append(player.next_media)
         # base details
         result = {
-            "player_name": player.name,
+            "player_name": self._display_name(player),
             "player_connected": int(player.connected),
             "player_needs_upgrade": 0,
             "player_is_upgrading": 0,
             "power": int(player.powered),
             "signalstrength": 0,
-            "waitingToPlay": 0,
+            # "waitingToPlay" deliberately omitted here, not hardcoded to
+            # 0 - confirmed via real LMS source (Slim/Control/Queries.pm's
+            # own status handler): it's only ever conditionally added,
+            # as 1, when the player isPlaying() but not yet "really"
+            # playing (buffering before actual audio output starts) -
+            # and left out of the response entirely otherwise, never
+            # sent as 0. Root-caused as the actual reason the Now
+            # Playing screen's elapsed/remaining time never displayed at
+            # all (not just wrong values): real client source (jive/
+            # slim/Player.lua's own _process_status) does
+            # `self.waitingToPlay = event.data.waitingToPlay or false` -
+            # Lua treats 0 as truthy (only nil/false are falsy), so a
+            # sent "waitingToPlay":0 became `0 or false` = 0, which is
+            # itself truthy - isWaitingToPlay() always returned true,
+            # and _updatePosition()'s own real "Bug 15814: do not update
+            # position if track isn't actually playing" guard
+            # unconditionally returned early on every single call. This
+            # project has no distinct "isPlaying but not really playing
+            # yet" buffering state to report as 1, so omitting the key
+            # entirely (matching real LMS's own "not waiting" case) is
+            # the correct behavior here, not a partial fix.
         }
         cur_item = playlist_items[0] if playlist_items else None
-        # additional details if player powered
-        if player.powered:
-            result = {
-                **result,
-                "mode": PLAYMODE_MAP[player.state],
-                "remote": 1,
-                "current_title": self.server.name,
-                "time": int(player.elapsed_seconds),
-                "duration": cur_item.metadata.get("duration", 0) if cur_item else 0,
-                "sync_master": "",
-                "sync_slaves": "",
-                "mixer volume": player.volume_level,
-                "player_ip": player.device_address,
-                "playlist_cur_index": 0,
-                "playlist_tracks": len(playlist_items),
-                "playlist_loop": [
+        # Real LMS's own status handler (Slim/Control/Queries.pm's
+        # statusQuery) NEVER gates any of this behind power state -
+        # "power" is just another, independent field reported
+        # alongside everything else here, not a gate for the rest of
+        # the response. Confirmed directly from real source: mode is
+        # added unconditionally; remote/current_title/time/rate/
+        # duration/can_seek are gated on `if (my $song =
+        # $client->playingSong())` - whether a song is actually
+        # loaded, not on power; playlist_tracks is added
+        # unconditionally, even when the queue is empty;
+        # playlist_cur_index is gated only on `if ($songCount > 0)`.
+        # This whole block used to be wrapped in "if player.powered:"
+        # instead, which was the real, confirmed root cause of a
+        # separate-looking bug: a real device test found the entire
+        # queue (14 real items, correctly present in MA's own queue
+        # the whole time) invisible on the client's Current Playlist
+        # screen after a server boot, showing an empty-playlist
+        # placeholder instead - because this player had never been
+        # powered on, that gate silently withheld mode/
+        # playlist_tracks/item_loop from every single status
+        # response as a direct result, exactly matching what was
+        # observed in a real device capture of this failure mode.
+        result = {
+            **result,
+            "mode": PLAYMODE_MAP[player.state],
+            **(
+                {
+                    "remote": 1,
+                    "current_title": self.server.name,
+                    "time": int(self._corrected_elapsed_seconds(player)),
+                    # Confirmed via real LMS source (Slim/Control/Queries.pm's
+                    # own status handler): hardcoded to 1 unconditionally,
+                    # with a comment noting it's "just here for backward
+                    # compatibility with older SBC firmware" - no trick-mode
+                    # semantics to replicate, this project doesn't support
+                    # trick modes either. Missing entirely until now - real
+                    # client source (jive/slim/Player.lua's own
+                    # _process_status) confirmed why that broke the Now
+                    # Playing screen's elapsed/remaining time display
+                    # completely rather than just showing a wrong value:
+                    # self.rate = tonumber(event.data.rate) went to nil, and
+                    # getTrackElapsed()'s own trick-mode correction
+                    # (self.trackCorrection = self.rate * (now -
+                    # self.trackSeen), only run while self.mode == "play")
+                    # multiplies by it unconditionally - nil * a number
+                    # errors out in Lua, taking the whole calculation down
+                    # rather than degrading gracefully.
+                    "rate": 1,
+                    "duration": (_duration := cur_item.metadata.get("duration", 0)),
+                    # Confirmed via real LMS source (same status handler,
+                    # right after "duration" there too): conditionally added
+                    # as 1 only when the current item can actually be
+                    # seeked, never sent as 0 - same pattern as
+                    # "waitingToPlay" above. Gated on _duration here since
+                    # MA's own player_queues.seek() itself refuses to seek
+                    # an item with no known duration ("Can not seek items
+                    # without duration") - matches real LMS's own dependency
+                    # (Slim::Music::Info::canSeek) closely enough without
+                    # inventing a separate, unconfirmed seekability check of
+                    # our own. Real client source (jive/slim/Player.lua's
+                    # own isTrackSeekable()) reads this directly to decide
+                    # whether the Now Playing screen's progress slider is
+                    # enabled or shown disabled.
+                    **({"can_seek": 1} if _duration else {}),
+                }
+                if cur_item
+                else {}
+            ),
+            "sync_master": "",
+            "sync_slaves": "",
+            "mixer volume": player.volume_level,
+            "player_ip": player.device_address,
+            **({"playlist_cur_index": 0} if playlist_items else {}),
+            "playlist_tracks": len(playlist_items),
+            "playlist_loop": [
+                _drop_empty_quality_fields(
                     playlist_item_from_media_details(index, item)
-                    for index, item in enumerate(playlist_items)
-                ],
-                **player.extra_data,
-            }
+                )
+                for index, item in enumerate(playlist_items)
+            ],
+            **player.extra_data,
+        }
 
         # additional details if menu requested
         if menu == "menu":
@@ -968,7 +1136,9 @@ class SlimProtoCLI:
                 continue
             if len(players) > limit:
                 break
-            players.append(create_player_item(start_index + index, player))
+            item = create_player_item(start_index + index, player)
+            item["name"] = self._display_name(player)
+            players.append(item)
         return ServerStatusResponse(
             {
                 "httpport": self.cli_port_json,
@@ -1050,7 +1220,7 @@ class SlimProtoCLI:
             return int(player.muted)
         raise NotImplementedError(f"No handler for mixer/{subcommand}")
 
-    def _handle_time(self, player_id: str, number: str | int) -> int | None:
+    async def _handle_time(self, player_id: str, number: str | int) -> int | None:
         """Handle player `time` command."""
         # <playerid> time <number|-number|+number|?>
         # The "time" command allows you to query the current number of seconds that the
@@ -1062,8 +1232,56 @@ class SlimProtoCLI:
         if not player:
             return None
         if number == "?":
-            return int(player.elapsed_seconds)
-        raise NotImplementedError("No handler for seek")
+            return int(self._corrected_elapsed_seconds(player))
+        # Real, confirmed API (controllers/player_queues/controller.py's
+        # own seek(queue_id, position) - queue_id is literally the
+        # player_id, same pattern already confirmed/used elsewhere in
+        # this project; position is an absolute number of seconds within
+        # the current item, matching this command's own "jump to a
+        # particular position" semantics exactly. Previously unimplemented
+        # entirely (raised NotImplementedError for any real seek target,
+        # only ever answering the "?" query above) - real device test
+        # confirmed this as the actual cause of the seek bar "snapping
+        # back" instead of seeking: the real client (jive/slim/Player.lua's
+        # own gototime()) sends exactly this command when the Now
+        # Playing screen's progress slider is dragged, and with no
+        # handler the position never actually changed, so the next
+        # status update simply reported the real, unchanged position.
+        #
+        # Relative seeks ("+N"/"-N", a string with an explicit sign
+        # prefix per this command's own docstring above) are resolved
+        # against the player's own current, corrected elapsed position
+        # (not the raw, stream-relative one - a relative seek after an
+        # earlier seek needs to add/subtract from where the track
+        # actually is, not from the current stream's own position 0)
+        # before calling seek() - MA's own seek() only takes an absolute
+        # position, it has no relative-seek concept of its own.
+        text = str(number)
+        if text and text[0] in "+-":
+            target = int(self._corrected_elapsed_seconds(player)) + int(text)
+        else:
+            target = int(number)
+        # self.command_handler.mass, not self.mass or player.mass - two
+        # real, confirmed-wrong guesses along the way here, both via
+        # real docker log captures: self.mass doesn't exist on this
+        # class (SlimProtoCLI only stores self.server, an aioslimproto
+        # SlimServer) - AttributeError("'SlimProtoCLI' object has no
+        # attribute 'mass'"); player.mass doesn't exist either, since
+        # self.server.get_player(player_id) returns aioslimproto's own
+        # native SlimClient (not this project's SqueezelitePlayer
+        # wrapper, as assumed from player.elapsed_seconds alone working
+        # - that's a real SlimClient property too, so it didn't actually
+        # distinguish the two) - AttributeError("'SlimClient' object
+        # has no attribute 'mass'"). The real, confirmed path came from
+        # provider.py's own construction: SlimServer(cli_command_handler=
+        # BrowseLibraryHandler(self), ...) - self here is the
+        # SqueezelitePlayerProvider (real self.mass, inherited from
+        # PlayerProvider). SlimProtoCLI.__init__ stores that handler as
+        # self.command_handler, and BrowseLibraryHandler (browselibrary.py,
+        # this same project) exposes .mass directly - the same object
+        # every other handler in that file already uses throughout.
+        await self.mass.player_queues.seek(queue_id=player_id, position=target)
+        return None
 
     async def _handle_power(
         self,
@@ -1091,9 +1309,24 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """Handle player `play` command."""
-        if player := self.server.get_player(player_id):
-            await player.play()
+        """Handle player `play` command.
+
+        mass.player_queues.play(queue_id), not player.play() directly -
+        confirmed via real source (aioslimproto/client.py's own
+        SlimClient.play(): "if self._state != PlayerState.PAUSED: return"
+        - a real device test found this explained "the play button
+        doesn't do anything" precisely: once a track naturally ends,
+        the player is PlayerState.STOPPED, not PAUSED, so player.play()
+        silently no-ops every time. MA's own player_queues.play()
+        (controllers/player_queues/controller.py) already handles both
+        cases correctly: forwards to the same low-level player.play()
+        when actually paused, or calls its own resume() otherwise -
+        exactly the real "restart the current queue position" behavior
+        this needed. self.command_handler.mass - the same real path
+        confirmed for _handle_time's own seek() call above (see that
+        method's own comment for the full account of how it was found).
+        """
+        await self.mass.player_queues.play(queue_id=player_id)
 
     async def _handle_stop(
         self,
@@ -1112,12 +1345,19 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """Handle player `stop` command."""
+        """Handle player `stop` command.
+
+        Same real fix as _handle_play above, same reason - this toggle's
+        own "not currently playing" branch called the same low-level
+        player.play() (a no-op unless actually paused), so toggling
+        play/pause after a track naturally ended (PlayerState.STOPPED,
+        not PAUSED) silently did nothing here too.
+        """
         if player := self.server.get_player(player_id):
             if player.state == PlayerState.PLAYING:
                 await player.pause()
             else:
-                await player.play()
+                await self.mass.player_queues.play(queue_id=player_id)
 
     async def _handle_mode(
         self,
@@ -1346,6 +1586,203 @@ class SlimProtoCLI:
                     },
                 )
 
+    def push_show_briefly(
+        self,
+        player_id: str,
+        text: list[str],
+        style: str | None = None,
+        icon_id: str | None = None,
+        duration_ms: int = 3000,
+        kind: str = "mixed",
+    ) -> None:
+        """Push a real LMS "showBriefly" text/artwork popup - either the.
+
+        KNOWN GAP: doesn't fire for MA-driven queue changes, only device-initiated ones - left as-is, too complex to fix cleanly.
+
+        "mixed" kind (e.g. the "Adding" / "to play next..." confirmation
+        with a badge and cover art shown when adding a track or album to
+        the queue) or the "song" kind (the "Now Playing" + track title
+        popup shown on every track load) - to a player's existing
+        displaystatus subscription, on demand - not a response to a
+        request, a push triggered at the moment an action (like
+        playlistcontrol add/insert/load) completes.
+
+        Confirmed real, end-to-end via LMS's own source, not guessed:
+        - Real client source (jive/slim/Player.lua's own
+          _process_displaystatus, subscribed via "displaystatus
+          subscribe:showbriefly" at connect time) reads the pushed
+          message as event.data.display directly. Its own type=="mixed"
+          (or "popupalbum") branch - main text, a second "subtext" line,
+          a badge icon ("style"=="add" -> badge_add), and artwork
+          fetched via "icon-id" - is exactly what real LMS sends for a
+          queue add. Its own type=="song" branch instead forwards the
+          text straight to a "playerTitleStatus" notification (briefly
+          overwriting the Now Playing screen's own title text) and
+          shows no popup window at all ("showMe = false") - this is a
+          DIFFERENT, separate real popup from the icon-only one
+          push_play_icon (below) sends; LMS sends both, independently,
+          for a single "load".
+        - Real server source for the "mixed"/add case: Slim/Control/
+          Commands.pm's own playlistcontrolCommand - `$client->
+          showBriefly({'jive' => {'type' => 'mixed', 'style' => 'add',
+          'text' => [$string, $info[0]], 'icon-id' => ...}})`.
+        - Real server source for the "song"/load case: Slim/Player/
+          StreamingController.pm's own _showTrackwaitStatus/
+          _playersMessage - `type => 'song', text => [$line1, $line2],
+          duration => 30000` for a local (non-remote) track. Initially
+          assumed gated on the player having been stopped beforehand
+          (matching that function's own "playingState == STOPPED"
+          check) - disproven by direct device testing (fired even
+          selecting "Play Now" on a track already playing); that field
+          turned out to be StreamingController's own internal state
+          machine, not the player's outwardly-visible mode, so this
+          fires on every load, unconditionally.
+        - Real strings.txt confirms the exact English text LMS itself
+          uses for the "mixed"/add case: "Adding" (JIVE_POPUP_ADDING)
+          and "to play next..." (JIVE_POPUP_TO_PLAY_NEXT) - callers
+          pass whichever as text[0], with the track/album title as
+          text[1]. For "song", real LMS uses "Now Playing" (the
+          JIVE_POPUP... wait, actually NOW_PLAYING token) as text[0].
+
+        This project's own _handle_displaystatus (the subscription
+        request's own handler) deliberately still returns None -
+        confirmed via real client source that a plain, un-pushed
+        displaystatus subscription response carries no "display" key at
+        all (the client only ever reads one when actually present), so
+        there is nothing useful to answer the bare subscription request
+        itself with. The real payload only exists at the moment this
+        method is called.
+        """
+        display: dict[str, Any] = {"type": kind, "text": text, "duration": duration_ms}
+        if style:
+            display["style"] = style
+        if icon_id:
+            display["icon-id"] = icon_id
+        self._push_displaystatus(player_id, display)
+
+    def push_play_icon(
+        self,
+        player_id: str,
+        text: list[str],
+        icon_id: str | None = None,
+    ) -> None:
+        """Push the real, separate, icon-only "play" popup (a brief.
+
+        ~1-2s icon with no visible text, shown on top of whatever screen
+        is active right before the Now Playing screen appears) -
+        confirmed via real LMS source as a SEPARATE showBriefly call
+        from push_show_briefly's own "song" kind, both of which real LMS
+        fires independently for the exact same "load a track" action:
+
+        - Slim/Control/Commands.pm's own playcontrolCommand, handling a
+          plain "play" command transitioning from a non-playing mode:
+          its own comment confirms the real mechanism directly - "'play'
+          from CLI needs to work the same as IR play button, by going
+          through playlist jump - this will include a showBriefly to
+          give feedback" - executing ['playlist', 'jump', $index,
+          $fadeIn].
+        - Slim/Control/Commands.pm's own playlistJumpCommand (the real
+          handler for that 'playlist jump' command, and so also the
+          real path a plain playlistcontrol cmd:load ultimately takes)
+          calls a local $showStatus helper after actually starting
+          playback: `$client->showBriefly($parts, {duration => 2})`
+          where $parts comes from Slim/Player/Player.pm's own
+          currentSongLines(jiveIconStyle => undef) - which defaults
+          jiveIconStyle to the player's own current playmode ("play",
+          immediately after starting playback) and builds `$jive = {
+          'type' => 'icon', 'text' => [$status, $track->title], 'style'
+          => $jiveIconStyle, 'play-mode' => $playmode, 'is-remote' =>
+          $track->isRemoteURL}`.
+        - Real client source (jive/slim/Player.lua's own
+          _process_displaystatus) confirms exactly why this has no
+          visible text despite the real payload carrying a "text"
+          field: its own type=="icon"-with-style branch ("special")
+          only ever sets the popup's CSS icon style
+          ("icon_popup_"..style) - it never reads or displays
+          display['text'] at all for this branch, unlike the "mixed"
+          and "song" kinds above. Gated client-side to the player's own
+          recent-input tracking ("icon-based showBrieflies only appear
+          for IR" - Framework:isMostRecentInput('ir') or ('key')) -
+          confirmed via real device testing that this condition is met
+          for a context-menu "Play Now" selection on this project's own
+          touchscreen hardware (JiveLite's own menu-selection handling
+          registers as 'key' input internally), so this isn't something
+          the server needs to account for - send the real payload
+          either way and let the client's own, unchanged logic decide.
+
+        "text" is a REQUIRED parameter, not optional, despite never
+        being visibly displayed for this popup - confirmed via a real
+        device test and a real client-side crash this caused before
+        this parameter existed: _process_displaystatus (Player.lua)
+        calls _formatShowBrieflyText(display['text']) UNCONDITIONALLY,
+        before any branching on "type" at all - that function does
+        `for i, v in ipairs(msg) do`, which raises "bad argument #1 to
+        'ipairs' (table expected, got nil)" when msg is nil, aborting
+        the entire response-sink callback right there - before the
+        client ever reaches the code that would actually show the icon
+        popup window. This is exactly why nothing appeared at all
+        despite the server-side push itself succeeding completely (both
+        push_show_briefly's and this method's own pushes confirmed
+        reaching the client and being written to the wire via this
+        project's own [DIAG] logging) - the crash happens entirely
+        client-side, after a perfectly good push arrives. Callers should
+        pass the same track-title text push_show_briefly's own "song"
+        push already has on hand, for consistency with real LMS's own
+        [$status, $track->title] shape, even though its contents are
+        never actually seen.
+        """
+        display: dict[str, Any] = {
+            "type": "icon",
+            "style": "play",
+            "play-mode": "play",
+            "is-remote": 0,
+            "text": text,
+        }
+        if icon_id:
+            display["icon-id"] = icon_id
+        self._push_displaystatus(player_id, display)
+
+    def _push_displaystatus(self, player_id: str, display: dict[str, Any]) -> None:
+        """Real, generic on-demand push to a player's existing.
+
+        displaystatus subscription - factored out of push_show_briefly
+        (the only caller until push_play_icon above needed the exact
+        same mechanism for a differently-shaped payload).
+
+        Mirrors _on_player_event's own existing menustatus push above
+        (same client lookup, same subscription-dict shape, same raw
+        client.queue.put_nowait(...) call) - the one real, structural
+        difference is the pushed "data" shape itself: menustatus pushes
+        a positional array ([player_id, item_loop, "replace",
+        player_id], that command's own real response convention, not
+        reusable here), where displaystatus pushes a plain {"display":
+        {...}} dict - confirmed via this same file's own
+        _handle_cometd_client_request, which wraps a command handler's
+        return value directly as "data" with no transformation, so a
+        normal (non-pushed) displaystatus response would carry exactly
+        this same {"display": {...}} shape too.
+        """
+        client = next(
+            (x for x in self._cometd_clients.values() if x.player_id == player_id),
+            None,
+        )
+        if not client:
+            return
+        sub = client.slim_subscriptions.get(
+            f"/{client.client_id}/slim/displaystatus/{player_id}",
+        )
+        if not sub:
+            return
+        with suppress(asyncio.QueueFull):
+            client.queue.put_nowait(
+                {
+                    "channel": sub["data"]["response"],
+                    "id": sub["id"],
+                    "data": {"display": display},
+                    "ext": {"priority": sub["data"].get("priority")},
+                },
+            )
+
     async def _do_periodic(self) -> None:
         """Execute periodic sending of state and cleanup."""
         while True:
@@ -1465,6 +1902,40 @@ def menu_item_from_media_details(
     return details
 
 
+# cli.py patch v5
+# v5 fixes player_name/name (status, players, serverstatus) always
+# showing the device's own raw self-reported name (aioslimproto's
+# player.name - read-only, sourced purely from the device's handshake,
+# no override mechanism) regardless of any name set via Music
+# Assistant's own UI. Real device test confirmed the actual symptom: a
+# rename via MA's UI had zero effect on the device's own screen, even
+# across a reboot. Now reads MA's own player.display_name via a new
+# _display_name() helper, falling back to player.name when the player
+# isn't resolvable as a real MA player object - never worse than
+# before. Also: this file still implements no "name" CLI command (the
+# real mechanism real LMS's own "Squeezebox Name" settings item uses
+# to push a persistent rename FROM the device) - out of scope for this
+# fix, which only addresses MA-side renames propagating down.
+# v1 fixed bitrate/samplerate/samplesize being hardcoded to "". v2 added
+# "type". v3 stopped always including these four keys, to fix a real
+# device-confirmed stray "* bits" (Lua treats "" as truthy) - but did
+# that by changing playlist_item_from_media_details() itself, a public,
+# unprefixed function whose own PlaylistItem return type declares these
+# as required, so v3 risked a real KeyError for any other caller of
+# this shared aioslimproto function using item["bitrate"] rather than
+# .get(). v4 reworks this: playlist_item_from_media_details() is back
+# to always returning all four (its original, fully backward-compatible
+# contract), and the empty-key-dropping now happens in a new, separate
+# _drop_empty_quality_fields() helper applied only at this file's own
+# "status" response call site - the one place that's genuinely ours to
+# shape, not the shared building block other projects might depend on.
+# Local patch marker for this project - not an upstream aioslimproto
+# version. Bump this comment (v5, v6, ...) on any further change to
+# this file so a diff against a fresh pip download always shows what's
+# actually been touched, same convention as browselibrary.py's own
+# version marker.
+
+
 def playlist_item_from_media_details(index: int, media: MediaDetails) -> PlaylistItem:
     """Parse PlaylistItem for the Json RPC interface from MediaDetails."""
     return {
@@ -1478,9 +1949,69 @@ def playlist_item_from_media_details(index: int, media: MediaDetails) -> Playlis
         "artwork_url": media.metadata.get("image_url", ""),
         "coverid": "-187651250107376",
         "duration": media.metadata.get("duration", ""),
-        "bitrate": "",
-        "samplerate": "",
-        "samplesize": "",
+        # Previously hardcoded to "" unconditionally, regardless of what
+        # MediaMetadata actually carried - these were never wired to
+        # anything. That's the actual root cause of the blank/wrong
+        # "44100 HZ * 32 bits" Now Playing display for MA-sourced tracks
+        # (vs. real LMS's own "mp3 * 192kbps CBR * 44100hz"). Now sourced
+        # the same way every other field in this function already is:
+        # from the metadata dict the caller builds. Falls back to "" -
+        # today's behavior - when a caller doesn't set these keys, so
+        # this is additive-only and doesn't change behavior for any
+        # existing MediaDetails producer.
+        #
+        # Deliberately kept as an unconditional "" fallback here, same
+        # as every other field in this function, even though a real
+        # device test found a client-side issue with that for these
+        # four specifically (Lua treats "" as truthy, so a client-side
+        # "if item.samplesize then ..." check still passes on an empty
+        # string - see the real fix, applied at this function's one
+        # call site instead of here). This function is public and
+        # unprefixed - a real, shared piece of aioslimproto other
+        # projects could import and call directly, and PlaylistItem
+        # (models.py) declares all four of these as required str
+        # fields, not NotRequired, so code elsewhere may reasonably use
+        # item["bitrate"] rather than .get(). Changing this function's
+        # own contract to sometimes omit keys would risk a real
+        # KeyError for exactly that kind of caller. The Lua-specific
+        # workaround belongs only where it's genuinely ours to shape:
+        # the one place this function's result gets embedded into an
+        # actual wire response, not in this shared building block
+        # itself.
+        #
+        # "type" confirmed via real LMS source (Slim/Control/Queries.pm's
+        # own CLI tag table: 'o' => ['type', 'TYPE', 'content_type']) as
+        # a real, separate field from "bitrate" - the client concatenates
+        # them itself (type * bitrate * samplerate), it doesn't derive
+        # the codec name from anywhere else.
+        "type": media.metadata.get("type", ""),
+        "bitrate": media.metadata.get("bitrate", ""),
+        "samplerate": media.metadata.get("samplerate", ""),
+        "samplesize": media.metadata.get("samplesize", ""),
+    }
+
+
+def _drop_empty_quality_fields(item: PlaylistItem) -> PlaylistItem:
+    """Drop empty type/bitrate/samplerate/samplesize keys before they hit the wire.
+
+    Lua treats an empty string as truthy (only nil/false are falsy), so
+    sending these with a "" value still passes a client-side check like
+    "if item.samplesize then ...", leaving a stray "* bits" with no
+    number - confirmed via a real device test. Applied only here, at
+    the one call site that assembles the actual "status" response
+    (below), not inside playlist_item_from_media_details() itself -
+    that function is a public, unprefixed piece of shared aioslimproto
+    other projects could call directly, and its own PlaylistItem return
+    type (models.py) declares these four as required, so changing what
+    it returns could break a caller using item["bitrate"] rather than
+    .get(). This wrapper only reshapes what this local patch sends over
+    the wire for its own response, without touching that shared
+    function's contract for anyone else.
+    """
+    return {  # type: ignore[typeddict-item]
+        k: v
+        for k, v in item.items()
+        if k not in ("type", "bitrate", "samplerate", "samplesize") or v
     }
 
 
