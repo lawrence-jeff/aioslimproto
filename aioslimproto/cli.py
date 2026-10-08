@@ -1264,6 +1264,9 @@ class SlimProtoCLI:
         if subcommand == "power":
             await player.power(not player.powered)
             return
+        if subcommand == "jump_fwd" and player.next_media:
+            await player.next()
+            return
         if subcommand.startswith("preset_") and subcommand.endswith(".single"):
             # only handle http-based presets, ignore/forward all other
             preset_id = subcommand.split("preset_")[1].split(".", maxsplit=1)[0]
