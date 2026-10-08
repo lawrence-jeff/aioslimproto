@@ -1646,40 +1646,6 @@ def menu_item_from_media_details(
     return details
 
 
-# cli.py patch v5
-# v5 fixes player_name/name (status, players, serverstatus) always
-# showing the device's own raw self-reported name (aioslimproto's
-# player.name - read-only, sourced purely from the device's handshake,
-# no override mechanism) regardless of any name set via Music
-# Assistant's own UI. Real device test confirmed the actual symptom: a
-# rename via MA's UI had zero effect on the device's own screen, even
-# across a reboot. Now reads MA's own player.display_name via a new
-# _display_name() helper, falling back to player.name when the player
-# isn't resolvable as a real MA player object - never worse than
-# before. Also: this file still implements no "name" CLI command (the
-# real mechanism real LMS's own "Squeezebox Name" settings item uses
-# to push a persistent rename FROM the device) - out of scope for this
-# fix, which only addresses MA-side renames propagating down.
-# v1 fixed bitrate/samplerate/samplesize being hardcoded to "". v2 added
-# "type". v3 stopped always including these four keys, to fix a real
-# device-confirmed stray "* bits" (Lua treats "" as truthy) - but did
-# that by changing playlist_item_from_media_details() itself, a public,
-# unprefixed function whose own PlaylistItem return type declares these
-# as required, so v3 risked a real KeyError for any other caller of
-# this shared aioslimproto function using item["bitrate"] rather than
-# .get(). v4 reworks this: playlist_item_from_media_details() is back
-# to always returning all four (its original, fully backward-compatible
-# contract), and the empty-key-dropping now happens in a new, separate
-# _drop_empty_quality_fields() helper applied only at this file's own
-# "status" response call site - the one place that's genuinely ours to
-# shape, not the shared building block other projects might depend on.
-# Local patch marker for this project - not an upstream aioslimproto
-# version. Bump this comment (v5, v6, ...) on any further change to
-# this file so a diff against a fresh pip download always shows what's
-# actually been touched, same convention as browselibrary.py's own
-# version marker.
-
-
 def playlist_item_from_media_details(index: int, media: MediaDetails) -> PlaylistItem:
     """Parse PlaylistItem for the Json RPC interface from MediaDetails."""
     return {

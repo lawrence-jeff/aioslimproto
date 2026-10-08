@@ -226,14 +226,6 @@ PLAYMODE_MAP = {
 }
 
 
-# models.py patch v1
-# Adds bitrate/samplerate/samplesize to MediaMetadata (see below). Local
-# patch marker for this project - not an upstream aioslimproto version.
-# Bump this comment (v2, v3, ...) on any further change to this file so
-# a diff against a fresh pip download always shows what's actually been
-# touched, same convention as browselibrary.py's own version marker.
-
-
 class MediaMetadata(TypedDict):
     """Optional metadata for playback."""
 
