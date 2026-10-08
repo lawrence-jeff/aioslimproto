@@ -454,6 +454,23 @@ class SlimProtoCLI:
         # cometd message is an array of commands/messages
         for cometd_msg in json_msg:
             channel = cometd_msg.get("channel")
+            if channel == "/slim/unsubscribe":
+                # The path names the client's previous session, which may already be gone.
+                # Answering "invalid clientId" would force a re-handshake, and the client
+                # would send the same stale unsubscribe again on the new connection.
+                subscription = cometd_msg["data"]["unsubscribe"]
+                stale_client = self._cometd_clients.get(subscription.split("/")[1])
+                if stale_client:
+                    stale_client.slim_subscriptions.pop(subscription, None)
+                response.append(
+                    {
+                        "id": cometd_msg.get("id", ""),
+                        "channel": channel,
+                        "clientId": stale_client.client_id if stale_client else None,
+                        "successful": True,
+                    },
+                )
+                continue
             # try to figure out clientid
             if not clientid:
                 clientid = cometd_msg.get("clientId")
@@ -466,9 +483,6 @@ class SlimProtoCLI:
             elif not clientid and channel in ("/slim/subscribe", "/slim/request"):
                 # pull clientId out of response channel
                 clientid = cometd_msg["data"]["response"].split("/")[1]
-            elif not clientid and channel == "/slim/unsubscribe":
-                # pull clientId out of unsubscribe
-                clientid = cometd_msg["data"]["unsubscribe"].split("/")[1]
             assert clientid, "No clientID provided"
             logger.debug(
                 "Incoming message for channel '%s' - clientid: %s",
@@ -628,28 +642,6 @@ class SlimProtoCLI:
                 # Return one-off result now, rest is handled by the subscription logic
                 self._handle_cometd_client_request(cometd_client, cometd_msg)
 
-            elif channel == "/slim/unsubscribe":
-                # ruff: noqa: E501, ERA001
-                # A request to unsubscribe from a Logitech Media Server event, this is not the same as /meta/unsubscribe
-                # A valid /slim/unsubscribe message looks like this:
-                # {
-                #   channel  => '/slim/unsubscribe',
-                #   data     => {
-                #     unsubscribe => '/slim/serverstatus',
-                #   }
-                response.append(
-                    {
-                        "id": msgid,
-                        "channel": channel,
-                        "clientId": clientid,
-                        "successful": True,
-                    },
-                )
-                cometd_client.slim_subscriptions.pop(
-                    cometd_msg["data"]["unsubscribe"],
-                    None,
-                )
-
             elif channel == "/slim/request":
                 # ruff: noqa: E501, ERA001
                 # A request to execute a one-time Logitech Media Server event
@@ -689,6 +681,8 @@ class SlimProtoCLI:
                         "successful": True,
                     },
                 )
+        if not clientid:
+            return web.json_response(response)
         # append any remaining messages from the queue
         while True:
             try:
