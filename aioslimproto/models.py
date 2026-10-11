@@ -236,12 +236,11 @@ class MediaMetadata(TypedDict):
     image_url: str  # optional
     duration: int  # optional
     # Playback format info for the Now Playing "<rate>Hz / <bits> bits" display.
-    # Named after PlaylistItem's fields (the JSON-RPC status shape these flow
-    # into), not MA's AudioFormat attributes. Optional: cli.py reads them with
-    # .get() and falls back to "".
-    bitrate: str  # optional
-    samplerate: str  # optional
-    samplesize: str  # optional
+    # Named after PlaylistItem's fields (the JSON-RPC status shape these flow into).
+    # Optional: cli.py reads them with .get() and falls back to "".
+    bitrate: str
+    samplerate: str
+    samplesize: str
 
 
 @dataclass

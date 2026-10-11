@@ -156,12 +156,11 @@ class SlimProtoCLI:
     _periodic_task: asyncio.Task | None = None
     _cli_server: asyncio.Server | None = None
     command_handler: SlimCLICommandHandler | None = None
-    # Set by the provider after construction. Returns MA's display_name for a
-    # player_id, or None if MA doesn't know that player. Independent of
-    # command_handler so the name works without the browse feature.
+    # Set by the provider after construction. Returns the display name for a player_id, or None if
+    # it is not known. Independent of command_handler so the name works without the browse feature.
     display_name_lookup: Callable[[str], str | None] | None = None
-    # Set by the provider after construction. The Music Assistant instance used
-    # for seek and play. Independent of command_handler so these work without browse.
+    # Set by the provider after construction: the host application, used for seek and play.
+    # Independent of command_handler so these work without browse.
     mass: Any | None = None
 
     def __init__(
@@ -872,11 +871,12 @@ class SlimProtoCLI:
         return PlayersResponse(count=len(players), players_loop=players)
 
     def _display_name(self, player: SlimClient) -> str:
-        """Return the name to show on the device's screen and in serverstatus/players_loop.
+        """
+        Return the name to show on the device's screen and in serverstatus/players_loop.
 
-        Prefers Music Assistant's display_name (custom name, else default name), since
-        SlimClient.name is read-only and comes from the device's own handshake, so a rename
-        in MA would otherwise never reach the device. Falls back to player.name when MA
+        Prefers display_name_lookup (the host application's custom or default name), since
+        SlimClient.name is read-only and comes from the device's own handshake, so a rename in the
+        host would otherwise never reach the device. Falls back to player.name when the lookup
         doesn't know the player (e.g. a sync-group member not registered individually).
         """
         if self.display_name_lookup is not None:
@@ -887,13 +887,13 @@ class SlimProtoCLI:
 
     @staticmethod
     def _corrected_elapsed_seconds(player: SlimClient) -> float:
-        """Return the elapsed seconds corrected for the seeked stream's position-0 restart.
+        """
+        Return the elapsed seconds corrected for the seeked stream's position-0 restart.
 
-        After a seek the stream restarts at position zero, so elapsed_seconds is
-        relative to the new, shorter stream. The "elapsed_offset" metadata (set in
-        player.py's play_media) is how far into the track that position 0 is; adding it
-        gives the real position. Returns 0 when STOPPED, which matches real LMS
-        hardware after a track finishes.
+        After a seek the stream restarts at position zero, so elapsed_seconds is relative to the
+        new, shorter stream. The "elapsed_offset" metadata (set by the host application when it
+        starts a stream) is how far into the track that position 0 is; adding it gives the real
+        position. Returns 0 when STOPPED, as LMS does after a track finishes.
         """
         if player.state == PlayerState.STOPPED:
             return 0
@@ -952,10 +952,9 @@ class SlimProtoCLI:
                     # Playing elapsed/remaining display entirely.
                     "rate": 1,
                     "duration": (_duration := cur_item.metadata.get("duration", 0)),
-                    # Only sent (as 1) when the item can be seeked, never as 0, like
-                    # waitingToPlay. Gated on _duration because MA's seek() refuses
-                    # items without a duration. The client reads this to enable the
-                    # Now Playing progress slider.
+                    # Only sent (as 1) when the item can be seeked, never as 0, like waitingToPlay.
+                    # Gated on _duration because seeking an item without a duration is refused. The
+                    # client reads this to enable the Now Playing progress slider.
                     **({"can_seek": 1} if _duration else {}),
                 }
                 if cur_item
@@ -1148,16 +1147,16 @@ class SlimProtoCLI:
             return None
         if number == "?":
             return int(self._corrected_elapsed_seconds(player))
-        # player_queues.seek(queue_id, position) takes an absolute position in seconds
-        # (queue_id is the player_id). Relative seeks (+N/-N) are resolved against the
-        # corrected elapsed position (see _corrected_elapsed_seconds), since MA's seek
-        # has no relative form and the raw position is relative to the current stream.
+        # player_queues.seek(queue_id, position) takes an absolute position in seconds (queue_id is
+        # the player_id). Relative seeks (+N/-N) are resolved against the corrected elapsed position
+        # (see _corrected_elapsed_seconds), since the seek has no relative form and the raw position
+        # is relative to the current stream.
         text = str(number)
         if text and text[0] in "+-":
             target = int(self._corrected_elapsed_seconds(player)) + int(text)
         else:
             target = int(number)
-        # The MA instance is reached through the provider's command handler
+        # The host application is reached through the provider's command handler
         # (self.command_handler.mass); neither SlimProtoCLI nor the SlimClient has .mass.
         await self.mass.player_queues.seek(queue_id=player_id, position=target)
         return None
@@ -1188,10 +1187,11 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """Handle player `play` command.
+        """
+        Handle player `play` command.
 
-        Uses mass.player_queues.play(), not SlimClient.play(): the latter only acts when
-        paused, so it silently does nothing once a track has ended (STOPPED). MA's play()
+        Uses the host's player_queues.play(), not SlimClient.play(): the latter only acts when
+        paused, so it silently does nothing once a track has ended (STOPPED). The host's play()
         handles both the paused and stopped cases.
         """
         await self.mass.player_queues.play(queue_id=player_id)
@@ -1213,13 +1213,12 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """Handle player `stop` command.
+        """
+        Handle the player `pause` command, which toggles play/pause.
 
-        Same real fix as _handle_play above, same reason - this toggle's
-        own "not currently playing" branch called the same low-level
-        player.play() (a no-op unless actually paused), so toggling
-        play/pause after a track naturally ended (PlayerState.STOPPED,
-        not PAUSED) silently did nothing here too.
+        Like _handle_play, the "not currently playing" branch uses the host's play() instead of the
+        low-level player.play(), which is a no-op unless paused, so toggling after a track ended
+        (STOPPED, not PAUSED) did nothing.
         """
         if player := self.server.get_player(player_id):
             if player.state == PlayerState.PLAYING:
@@ -1463,21 +1462,22 @@ class SlimProtoCLI:
         duration_ms: int = 3000,
         kind: str = "mixed",
     ) -> None:
-        """Push an LMS "showBriefly" popup to a player's displaystatus subscription.
+        """
+        Push an LMS "showBriefly" popup to a player's displaystatus subscription.
 
-        KNOWN GAP: doesn't fire for MA-driven queue changes, only device-initiated
-        ones - left as-is, too complex to fix cleanly.
+        Limitation: it doesn't fire for queue changes made from the host application, only device-
+        initiated ones.
 
         Two kinds, sent on demand when an action completes (not as a request response):
-        - "mixed": the "Adding" / "to play next..." confirmation shown when adding to
-          the queue, with a badge and cover art (via icon_id). text[0] is the label,
-          text[1] the track or album title.
-        - "song": "Now Playing" + track title, sent on every track load (even when
-          something was already playing). The client shows it by overwriting the Now
-          Playing title text, with no popup window.
+        - "mixed": the "Adding" / "to play next..." confirmation shown when adding to the queue,
+          with a badge and cover art (via icon_id). text[0] is the label, text[1] the track or album
+          title.
+        - "song": "Now Playing" + track title, sent on every track load (even when something was
+          already playing). The client shows it by overwriting the Now Playing title text, with no
+          popup window.
 
-        _handle_displaystatus still returns None for the bare subscription request:
-        a displaystatus response only carries a "display" key when pushed.
+        _handle_displaystatus still returns None for the bare subscription request: a displaystatus
+        response only carries a "display" key when pushed.
         """
         display: dict[str, Any] = {"type": kind, "text": text, "duration": duration_ms}
         if style:
