@@ -663,3 +663,47 @@ class TestCometDLongPollWait:
         assert elapsed < self._MAX_ACCEPTABLE_SECONDS, (
             f"took {elapsed:.1f}s - hit the 30s long-poll wait."
         )
+
+
+class TestCorrectedElapsedSeconds:
+    """The elapsed time is corrected by the metadata's elapsed_offset after a seek."""
+
+    @staticmethod
+    def _player(
+        state: PlayerState, metadata: dict | None, elapsed: float
+    ) -> SimpleNamespace:
+        media = SimpleNamespace(metadata=metadata) if metadata is not None else None
+        return SimpleNamespace(
+            state=state, current_media=media, elapsed_seconds=elapsed
+        )
+
+    def test_offset_is_added_to_the_stream_position(self) -> None:
+        """A stream that restarted at zero reports the real position in the track."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 90}, 5)
+        assert (
+            SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
+                cast("SlimClient", player)
+            )
+            == 95
+        )
+
+    def test_missing_or_empty_offset_means_zero(self) -> None:
+        """Without the field the stream position is the track position."""
+        no_key = self._player(PlayerState.PLAYING, {"duration": 200}, 5)
+        none_value = self._player(PlayerState.PLAYING, {"elapsed_offset": None}, 5)
+        no_media = self._player(PlayerState.PLAYING, None, 5)
+        for player in (no_key, none_value, no_media):
+            result = SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
+                cast("SlimClient", player)
+            )
+            assert result == 5
+
+    def test_stopped_player_reports_zero(self) -> None:
+        """After a track ends the elapsed time is zero, as on LMS."""
+        player = self._player(PlayerState.STOPPED, {"elapsed_offset": 90}, 5)
+        assert (
+            SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
+                cast("SlimClient", player)
+            )
+            == 0
+        )

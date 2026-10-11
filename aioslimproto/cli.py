@@ -891,7 +891,7 @@ class SlimProtoCLI:
         Return the elapsed seconds corrected for the seeked stream's position-0 restart.
 
         After a seek the stream restarts at position zero, so elapsed_seconds is relative to the
-        new, shorter stream. The "elapsed_offset" metadata (set by the host application when it
+        new, shorter stream. MediaMetadata.elapsed_offset (set by the host application when it
         starts a stream) is how far into the track that position 0 is; adding it gives the real
         position. Returns 0 when STOPPED, as LMS does after a track finishes.
         """
