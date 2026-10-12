@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 import pytest
 
-from aioslimproto.cli import SlimProtoCLI
+from aioslimproto.cli import SEEK_PENDING_SECONDS, SlimProtoCLI
 from aioslimproto.client import SlimClient
 from aioslimproto.models import PlayerState
 from aioslimproto.server import SlimServer
@@ -674,18 +674,29 @@ class TestCorrectedElapsedSeconds:
     ) -> SimpleNamespace:
         media = SimpleNamespace(metadata=metadata) if metadata is not None else None
         return SimpleNamespace(
-            state=state, current_media=media, elapsed_seconds=elapsed
+            state=state,
+            current_media=media,
+            elapsed_seconds=elapsed,
+            player_id="p1",
+            _awaiting_stream_start=False,
+            _buffering_media=None,
         )
+
+    def _corrected(self, player: SimpleNamespace) -> float:
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli._pending_seeks = self.pending  # noqa: SLF001
+        return cli._corrected_elapsed_seconds(  # noqa: SLF001
+            cast("SlimClient", player)
+        )
+
+    def setup_method(self) -> None:
+        """Start every test without a pending seek."""
+        self.pending: dict[str, tuple[int, object, float]] = {}
 
     def test_offset_is_added_to_the_stream_position(self) -> None:
         """A stream that restarted at zero reports the real position in the track."""
         player = self._player(PlayerState.PLAYING, {"elapsed_offset": 90}, 5)
-        assert (
-            SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
-                cast("SlimClient", player)
-            )
-            == 95
-        )
+        assert self._corrected(player) == 95
 
     def test_missing_or_empty_offset_means_zero(self) -> None:
         """Without the field the stream position is the track position."""
@@ -693,17 +704,48 @@ class TestCorrectedElapsedSeconds:
         none_value = self._player(PlayerState.PLAYING, {"elapsed_offset": None}, 5)
         no_media = self._player(PlayerState.PLAYING, None, 5)
         for player in (no_key, none_value, no_media):
-            result = SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
-                cast("SlimClient", player)
-            )
+            result = self._corrected(player)
             assert result == 5
+
+    def test_a_pending_stream_uses_its_own_offset(self) -> None:
+        """Right after a seek the position is the new offset, as the clock ticks."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 62}, 2)
+        player._awaiting_stream_start = True  # noqa: SLF001
+        player._buffering_media = SimpleNamespace(  # noqa: SLF001
+            metadata={"elapsed_offset": 116}
+        )
+        assert self._corrected(player) == 116
+
+    def test_the_playing_stream_offset_is_used_once_it_started(self) -> None:
+        """When no stream is pending, the playing stream's offset is used."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 62}, 3)
+        player._buffering_media = SimpleNamespace(  # noqa: SLF001
+            metadata={"elapsed_offset": 116}
+        )
+        assert self._corrected(player) == 65
+
+    def test_a_requested_seek_shows_its_target_until_the_new_stream_starts(
+        self,
+    ) -> None:
+        """The target applies from the request on, before a new stream is asked for."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
+        self.pending["p1"] = (86, player.current_media, time.monotonic())
+        assert self._corrected(player) == 86
+        # the new stream started: current_media is a different object
+        player.current_media = SimpleNamespace(metadata={"elapsed_offset": 86})
+        player.elapsed_seconds = 1
+        assert self._corrected(player) == 87
+        assert "p1" not in self.pending
+
+    def test_a_requested_seek_that_never_starts_a_stream_times_out(self) -> None:
+        """If the stream never restarts, the real position is shown again."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
+        started = time.monotonic() - SEEK_PENDING_SECONDS - 1
+        self.pending["p1"] = (86, player.current_media, started)
+        assert self._corrected(player) == 6
+        assert "p1" not in self.pending
 
     def test_stopped_player_reports_zero(self) -> None:
         """After a track ends the elapsed time is zero, as on LMS."""
         player = self._player(PlayerState.STOPPED, {"elapsed_offset": 90}, 5)
-        assert (
-            SlimProtoCLI._corrected_elapsed_seconds(  # noqa: SLF001
-                cast("SlimClient", player)
-            )
-            == 0
-        )
+        assert self._corrected(player) == 0

@@ -149,6 +149,11 @@ def parse_args(raw_values: list[SlimCLIScalar]) -> tuple[ArgsType, KwargsType]:
     return (args, kwargs)
 
 
+# How long a requested seek's target is shown before the position is read from the player
+# again, in case the new stream never starts.
+SEEK_PENDING_SECONDS = 12.0
+
+
 class SlimProtoCLI:
     """Basic implementation of CLI control for SlimProto players."""
 
@@ -183,6 +188,9 @@ class SlimProtoCLI:
         self.command_handler = command_handler
         self.extra_routes = extra_routes or {}
         self._cometd_clients: dict[str, CometDClient] = {}
+        # seeks asked for by a client whose new stream has not started yet:
+        # player_id -> (target seconds, current_media at the time, monotonic start)
+        self._pending_seeks: dict[str, tuple[int, Any, float]] = {}
         self._player_map: dict[str, str] = {}
         self._apprunner: web.AppRunner | None = None
         self._webapp: web.Application | None = None
@@ -885,8 +893,7 @@ class SlimProtoCLI:
                 return name
         return player.name
 
-    @staticmethod
-    def _corrected_elapsed_seconds(player: SlimClient) -> float:
+    def _corrected_elapsed_seconds(self, player: SlimClient) -> float:
         """
         Return the elapsed seconds corrected for the seeked stream's position-0 restart.
 
@@ -897,10 +904,30 @@ class SlimProtoCLI:
         """
         if player.state == PlayerState.STOPPED:
             return 0
+        # A client that asked for a seek is shown the target from that moment: the status
+        # pushes the seek itself triggers come before the new stream is requested.
+        if pending := self._pending_seeks.get(player.player_id):
+            target, media_at_seek, started = pending
+            if (
+                player.current_media is media_at_seek
+                and time.monotonic() - started < SEEK_PENDING_SECONDS
+            ):
+                return target
+            del self._pending_seeks[player.player_id]
+        media = player.current_media
+        elapsed = player.elapsed_seconds
+        # Between requesting a new stream and its start the client reports position 0 of the new
+        # stream while current_media is still the old track, so the new stream's own offset
+        # applies. The client's running clock can already be ticking then (play() sets PLAYING
+        # before the start is confirmed), so the elapsed time is held at 0 as well.
+        if player._awaiting_stream_start:  # noqa: SLF001
+            elapsed = 0
+            if player._buffering_media:  # noqa: SLF001
+                media = player._buffering_media  # noqa: SLF001
         offset = 0
-        if player.current_media and player.current_media.metadata:
-            offset = player.current_media.metadata.get("elapsed_offset", 0) or 0
-        return player.elapsed_seconds + offset
+        if media and media.metadata:
+            offset = media.metadata.get("elapsed_offset", 0) or 0
+        return elapsed + offset
 
     async def _handle_status(
         self,
@@ -1158,7 +1185,16 @@ class SlimProtoCLI:
             target = int(number)
         # The host application is reached through the provider's command handler
         # (self.command_handler.mass); neither SlimProtoCLI nor the SlimClient has .mass.
-        await self.mass.player_queues.seek(queue_id=player_id, position=target)
+        self._pending_seeks[player_id] = (
+            target,
+            player.current_media,
+            time.monotonic(),
+        )
+        try:
+            await self.mass.player_queues.seek(queue_id=player_id, position=target)
+        except Exception:
+            self._pending_seeks.pop(player_id, None)
+            raise
         return None
 
     async def _handle_power(
