@@ -678,8 +678,6 @@ class TestCorrectedElapsedSeconds:
             current_media=media,
             elapsed_seconds=elapsed,
             player_id="p1",
-            _awaiting_stream_start=False,
-            _buffering_media=None,
         )
 
     def _corrected(self, player: SimpleNamespace) -> float:
@@ -707,23 +705,6 @@ class TestCorrectedElapsedSeconds:
             result = self._corrected(player)
             assert result == 5
 
-    def test_a_pending_stream_uses_its_own_offset(self) -> None:
-        """Right after a seek the position is the new offset, as the clock ticks."""
-        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 62}, 2)
-        player._awaiting_stream_start = True  # noqa: SLF001
-        player._buffering_media = SimpleNamespace(  # noqa: SLF001
-            metadata={"elapsed_offset": 116}
-        )
-        assert self._corrected(player) == 116
-
-    def test_the_playing_stream_offset_is_used_once_it_started(self) -> None:
-        """When no stream is pending, the playing stream's offset is used."""
-        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 62}, 3)
-        player._buffering_media = SimpleNamespace(  # noqa: SLF001
-            metadata={"elapsed_offset": 116}
-        )
-        assert self._corrected(player) == 65
-
     def test_a_requested_seek_shows_its_target_until_the_new_stream_starts(
         self,
     ) -> None:
@@ -744,6 +725,18 @@ class TestCorrectedElapsedSeconds:
         self.pending["p1"] = (86, player.current_media, started)
         assert self._corrected(player) == 6
         assert "p1" not in self.pending
+
+    def test_set_pending_position_applies_until_the_stream_starts(self) -> None:
+        """The hook shows the position at once, and stops once current_media changes."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 40}, 3)
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli._pending_seeks = self.pending  # noqa: SLF001
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli.set_pending_position("p1", 70.4)
+        assert self._corrected(player) == 70
+        player.current_media = SimpleNamespace(metadata={"elapsed_offset": 70})
+        player.elapsed_seconds = 2
+        assert self._corrected(player) == 72
 
     def test_stopped_player_reports_zero(self) -> None:
         """After a track ends the elapsed time is zero, as on LMS."""
