@@ -89,6 +89,8 @@ class SlimCLICommand:
 SlimCLICommandHandler = Callable[
     [SlimCLICommand], SlimCLICommandResponse | Awaitable[SlimCLICommandResponse]
 ]
+# An aiohttp handler for a route a consuming application adds to the CLI web server
+SlimRouteHandler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 @dataclass
@@ -149,6 +151,11 @@ def parse_args(raw_values: list[SlimCLIScalar]) -> tuple[ArgsType, KwargsType]:
     return (args, kwargs)
 
 
+# How long a requested seek's target is shown before the position is read from the player
+# again, in case the new stream never starts.
+SEEK_PENDING_SECONDS = 12.0
+
+
 class SlimProtoCLI:
     """Basic implementation of CLI control for SlimProto players."""
 
@@ -166,6 +173,7 @@ class SlimProtoCLI:
         cli_port: int | None = None,
         cli_port_json: int | None = 0,
         command_handler: SlimCLICommandHandler | None = None,
+        extra_routes: dict[str, SlimRouteHandler] | None = None,
     ) -> None:
         """
         Initialize Telnet and/or Json interface CLI.
@@ -177,7 +185,11 @@ class SlimProtoCLI:
         self.cli_port_json = cli_port_json
         self.logger = server.logger.getChild("cli")
         self.command_handler = command_handler
+        self.extra_routes = extra_routes or {}
         self._cometd_clients: dict[str, CometDClient] = {}
+        # seeks asked for by a client whose new stream has not started yet:
+        # player_id -> (target seconds, current_media at the time, monotonic start)
+        self._pending_seeks: dict[str, tuple[int, Any, float]] = {}
         self._player_map: dict[str, str] = {}
         self._apprunner: web.AppRunner | None = None
         self._webapp: web.Application | None = None
@@ -215,6 +227,8 @@ class SlimProtoCLI:
                 self._handle_jsonrpc_client,
             )
             self._webapp.router.add_route("*", "/cometd", self._handle_cometd_client)
+            for path, handler in self.extra_routes.items():
+                self._webapp.router.add_route("*", path, handler)
             await self._apprunner.setup()
             # set host to None to bind to all addresses on both IPv4 and IPv6
             self._tcp_site = web.TCPSite(
@@ -872,6 +886,60 @@ class SlimProtoCLI:
             players.append(item)
         return PlayersResponse(count=len(players), players_loop=players)
 
+    def set_pending_position(self, player_id: str, seconds: float | None) -> None:
+        """
+        Report a position for a player until the stream it is about to start has started.
+
+        Call it before asking a player to start a stream at a position other than the
+        one it reports now (a seek, or a new track). The position is shown to the clients
+        from that moment, instead of the old one.
+
+        :param player_id: The player that is going to start the stream.
+        :param seconds: The position in the track the new stream starts at, or None to
+            stop reporting one (for example when the stream could not be started).
+        """
+        if seconds is None:
+            self._pending_seeks.pop(player_id, None)
+        elif player := self.server.get_player(player_id):
+            self._pending_seeks[player_id] = (
+                int(seconds),
+                player.current_media,
+                time.monotonic(),
+            )
+
+    def _corrected_elapsed_seconds(self, player: SlimClient) -> float:
+        """
+        Return the elapsed seconds corrected for the seeked stream's position-0 restart.
+
+        After a seek the stream restarts at position zero, so elapsed_seconds is relative to the
+        new, shorter stream. MediaMetadata.elapsed_offset (set by the host application when it
+        starts a stream) is how far into the track that position 0 is; adding it gives the real
+        position. Returns 0 when STOPPED, as LMS does after a track finishes.
+        """
+        # Without this a stopped player's screen keeps the position it had: the player's own
+        # reports reset it to 0 about two seconds after the stop, but nothing pushes that
+        # to the client, and after a seek the reset leaves the seek point. This only
+        # changes what is shown: Play afterwards resumes where MA saved the position at
+        # the stop, not at 0. Unlike the offset and pending seek below it changes the
+        # default for every host, so it stays out of an upstream change for those hooks.
+        if player.state == PlayerState.STOPPED:
+            return 0
+        # A client that asked for a seek is shown the target from that moment until the new
+        # stream starts: the status pushes the seek itself triggers come before the new stream
+        # is requested, and the player reports position 0 of it before it is confirmed started.
+        if pending := self._pending_seeks.get(player.player_id):
+            target, media_at_seek, started = pending
+            if (
+                player.current_media is media_at_seek
+                and time.monotonic() - started < SEEK_PENDING_SECONDS
+            ):
+                return target
+            del self._pending_seeks[player.player_id]
+        offset = 0
+        if player.current_media and player.current_media.metadata:
+            offset = player.current_media.metadata.get("elapsed_offset", 0) or 0
+        return player.elapsed_seconds + offset
+
     async def _handle_status(
         self,
         player_id: str,
@@ -916,8 +984,16 @@ class SlimProtoCLI:
                 {
                     "remote": 1,
                     "current_title": self.server.name,
-                    "time": int(player.elapsed_seconds),
-                    "duration": cur_item.metadata.get("duration", 0),
+                    "time": int(self._corrected_elapsed_seconds(player)),
+                    # Hardcoded to 1 like LMS. The client multiplies by it when
+                    # correcting the elapsed time, so a missing rate breaks the Now
+                    # Playing elapsed/remaining display entirely.
+                    "rate": 1,
+                    "duration": (_duration := cur_item.metadata.get("duration", 0)),
+                    # Only sent (as 1) when the item can be seeked, never as 0, like waitingToPlay.
+                    # Gated on _duration because seeking an item without a duration is refused. The
+                    # client reads this to enable the Now Playing progress slider.
+                    **({"can_seek": 1} if _duration else {}),
                 }
                 if cur_item
                 else {}
@@ -1110,7 +1186,7 @@ class SlimProtoCLI:
         if not player:
             return None
         if number == "?":
-            return int(player.elapsed_seconds)
+            return int(self._corrected_elapsed_seconds(player))
         raise NotImplementedError("No handler for seek")
 
     async def _handle_power(

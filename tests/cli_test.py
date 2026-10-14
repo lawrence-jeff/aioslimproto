@@ -13,6 +13,7 @@ from urllib.parse import quote
 import pytest
 
 from aioslimproto.cli import (
+    SEEK_PENDING_SECONDS,
     CometDClient,
     SlimProtoCLI,
     _drop_empty_quality_fields,
@@ -1104,6 +1105,7 @@ class TestStatusShape:
     ) -> None:
         """A loaded track has a position, a duration and an index."""
         dummy_player.current_media = self._media(title="Song", duration=200)
+        dummy_player.state = PlayerState.PLAYING
         dummy_player.elapsed_seconds = 12.7
 
         status = await self._status(dummy_server, dummy_player)
@@ -1174,3 +1176,380 @@ class TestDropEmptyQualityFields:
         assert "samplesize" not in trimmed
         assert trimmed["artist"] == ""
         assert trimmed["title"] == "Song"
+
+
+async def _status(player: SlimClient, **kwargs: object) -> dict:
+    server = SimpleNamespace(
+        name="testserver",
+        logger=logging.getLogger(),
+        players=[player],
+        get_player=lambda _id: player,
+    )
+    cli = SlimProtoCLI(cast("SlimServer", server))
+    return cast(
+        "dict",
+        await cli._handle_status(player.player_id, "-", 2, **kwargs),  # noqa: SLF001
+    )
+
+
+def _status_player(base: SlimClient, **changes: object) -> SlimClient:
+    """Return a copy of the dummy player with some attributes changed."""
+    return cast("SlimClient", SimpleNamespace(**{**vars(base), **changes}))
+
+
+def _media(**metadata: object) -> MediaDetails:
+    return MediaDetails(url="http://host/stream.flac", metadata=metadata)  # type: ignore[arg-type]
+
+
+class TestStatusResponse:
+    """What the status reply carries, and when."""
+
+    @pytest.mark.asyncio
+    async def test_the_mode_and_queue_size_are_sent_even_when_powered_off(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """Power is a reported field; it does not hide the rest, as in LMS."""
+        status = await _status(_status_player(dummy_player, powered=False))
+        assert status["power"] == 0
+        assert status["mode"] == "stop"
+        assert status["playlist_tracks"] == 0
+        assert status["mixer volume"] == 50
+
+    @pytest.mark.asyncio
+    async def test_waiting_to_play_is_never_sent_as_zero(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """The client treats a sent 0 as true, so the key is left out."""
+        status = await _status(dummy_player)
+        assert "waitingToPlay" not in status
+
+    @pytest.mark.asyncio
+    async def test_a_track_sends_rate_time_duration_and_can_seek(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """A loaded track with a duration can be seeked and has a running clock."""
+        player = _status_player(
+            dummy_player,
+            state=PlayerState.PLAYING,
+            elapsed_seconds=12.7,
+            current_media=_media(title="Song", duration=200),
+        )
+        status = await _status(player)
+        assert status["mode"] == "play"
+        assert status["rate"] == 1
+        assert status["time"] == 12
+        assert status["duration"] == 200
+        assert status["can_seek"] == 1
+        assert status["playlist_cur_index"] == 0
+        assert status["playlist_tracks"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_track_without_a_duration_cannot_be_seeked(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """can_seek is only ever sent as 1, and only when there is a duration."""
+        player = _status_player(
+            dummy_player, current_media=_media(title="Stream", duration=0)
+        )
+        status = await _status(player)
+        assert "can_seek" not in status
+        assert status["duration"] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_menu_status_has_no_item_loop_when_nothing_is_loaded(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """Clients read item_loop[1] when the key exists, so an empty one is omitted."""
+        status = await _status(_status_player(dummy_player, presets=[]), menu="menu")
+        assert "item_loop" not in status
+        assert status["count"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("current", "following", "expected"),
+        [
+            ("Song", None, ["Song"]),
+            ("Song", "Next", ["Song", "Next"]),
+            (None, "Next", ["Next"]),
+        ],
+    )
+    async def test_the_menu_status_lists_the_current_and_next_track(
+        self,
+        dummy_player: SlimClient,
+        current: str | None,
+        following: str | None,
+        expected: list[str],
+    ) -> None:
+        """item_loop holds the track that is loaded and the one queued after it."""
+        player = _status_player(
+            dummy_player,
+            current_media=_media(title=current) if current else None,
+            next_media=_media(title=following) if following else None,
+            presets=[],
+        )
+        status = await _status(player, menu="menu")
+        assert [item["text"] for item in status["item_loop"]] == expected
+
+    @pytest.mark.asyncio
+    async def test_nothing_loaded_sends_no_song_fields(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """With nothing in the queue there is no track, position or index."""
+        status = await _status(dummy_player)
+        for key in ("rate", "time", "duration", "can_seek", "playlist_cur_index"):
+            assert key not in status
+        assert status["playlist_loop"] == []
+
+    @pytest.mark.asyncio
+    async def test_empty_quality_fields_are_left_out_of_the_queue_items(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """An empty string shows as a stray "* bits" on the client, so it is dropped."""
+        player = _status_player(
+            dummy_player,
+            current_media=_media(
+                title="Song", type="flac", bitrate="", samplerate="44100", samplesize=""
+            ),
+        )
+        item = (await _status(player))["playlist_loop"][0]
+        assert item["type"] == "flac"
+        assert item["samplerate"] == "44100"
+        assert "bitrate" not in item
+        assert "samplesize" not in item
+
+
+class TestQualityFields:
+    """The playlist item builder and the helper that trims it for the wire."""
+
+    def test_the_item_carries_the_quality_fields_of_the_metadata(self) -> None:
+        """The codec, bitrate, sample rate and size come from the metadata."""
+        item = playlist_item_from_media_details(
+            3,
+            _media(type="mp3", bitrate="320kbps", samplerate="44100", samplesize="16"),
+        )
+        assert item["playlist index"] == 3
+        assert item["type"] == "mp3"
+        assert item["bitrate"] == "320kbps"
+        assert item["samplerate"] == "44100"
+        assert item["samplesize"] == "16"
+
+    def test_the_item_keeps_empty_quality_keys_when_the_metadata_has_none(self) -> None:
+        """The public builder still returns every key its type declares."""
+        item = playlist_item_from_media_details(0, _media(title="Song"))
+        for key in ("type", "bitrate", "samplerate", "samplesize"):
+            assert item[key] == ""
+
+    def test_only_empty_quality_fields_are_dropped(self) -> None:
+        """Other empty fields stay; non-empty quality fields stay."""
+        item = playlist_item_from_media_details(
+            0, _media(title="Song", type="flac", samplerate="96000")
+        )
+        trimmed = _drop_empty_quality_fields(item)
+        assert trimmed["type"] == "flac"
+        assert trimmed["samplerate"] == "96000"
+        assert "bitrate" not in trimmed
+        assert "samplesize" not in trimmed
+        assert trimmed["artist"] == ""
+        assert trimmed["title"] == "Song"
+
+
+class TestExtraRoutes:
+    """Routes the application wants on the CLI's own web server."""
+
+    def test_the_routes_are_kept_for_the_web_server(
+        self, dummy_server: SlimServer
+    ) -> None:
+        """They are passed to the CLI and registered when it starts."""
+
+        async def handler(_request: object) -> None:
+            return None
+
+        cli = SlimProtoCLI(dummy_server, extra_routes={"/music/{id}/cover": handler})
+        assert cli.extra_routes == {"/music/{id}/cover": handler}
+        assert SlimProtoCLI(dummy_server).extra_routes == {}
+
+    def test_the_server_hands_them_to_its_cli(self) -> None:
+        """SlimServer takes them in its constructor, as the router freezes at start."""
+
+        async def handler(_request: object) -> None:
+            return None
+
+        server = SlimServer(
+            ip_address="127.0.0.1", name="t", extra_routes={"/x": handler}
+        )
+        assert server.cli.extra_routes == {"/x": handler}
+
+
+class TestTimeCommand:
+    """The time command reports the position; a seek is left to the application."""
+
+    @staticmethod
+    def _cli() -> tuple[SlimProtoCLI, SimpleNamespace]:
+        player = SimpleNamespace(
+            player_id="p1",
+            state=PlayerState.PLAYING,
+            current_media=SimpleNamespace(metadata={"elapsed_offset": 60}),
+            elapsed_seconds=5,
+        )
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli._pending_seeks = {}  # noqa: SLF001
+        return cli, player
+
+    def test_the_position_query_is_corrected_for_a_restarted_stream(self) -> None:
+        """A seeked stream restarted at zero still reports the position in the track."""
+        cli, _player = self._cli()
+        assert cli._handle_time("p1", "?") == 65  # noqa: SLF001
+
+    def test_a_seek_is_not_handled_by_the_library(self) -> None:
+        """Seeking needs a new stream, so it raises NotImplementedError, as upstream."""
+        cli, _player = self._cli()
+        with pytest.raises(NotImplementedError):
+            cli._handle_time("p1", 90)  # noqa: SLF001
+
+    def test_a_pending_position_can_be_set_and_cleared(self) -> None:
+        """The application sets the position a seek will land on, and may undo it."""
+        cli, player = self._cli()
+        cli.set_pending_position("p1", 90.6)
+        assert cli._handle_time("p1", "?") == 90  # noqa: SLF001
+        cli.set_pending_position("p1", None)
+        assert cli._handle_time("p1", "?") == 65  # noqa: SLF001
+        # an unknown player is ignored
+        cli.server = SimpleNamespace(get_player=lambda _id: None)  # type: ignore[assignment]
+        cli.set_pending_position("nobody", 10)
+        assert "nobody" not in cli._pending_seeks  # noqa: SLF001
+        assert player.player_id == "p1"
+
+
+class TestPositionForAHostThatUsesNoHooks:
+    """Without elapsed_offset and set_pending_position, the position is the player's."""
+
+    NOT_STOPPED = (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.BUFFERING)
+
+    @staticmethod
+    def _cli(state: PlayerState, elapsed: float, metadata: dict) -> SlimProtoCLI:
+        player = SimpleNamespace(
+            player_id="p1",
+            state=state,
+            current_media=SimpleNamespace(metadata=metadata),
+            elapsed_seconds=elapsed,
+        )
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli._pending_seeks = {}  # noqa: SLF001
+        return cli
+
+    @pytest.mark.parametrize("state", NOT_STOPPED)
+    @pytest.mark.parametrize("metadata", [{}, {"duration": 200}])
+    def test_the_position_query_is_the_players_elapsed_time(
+        self, state: PlayerState, metadata: dict
+    ) -> None:
+        """`time ?` answers int(elapsed_seconds), as before the offset existed."""
+        cli = self._cli(state, 41.9, metadata)
+        assert cli._handle_time("p1", "?") == 41  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", NOT_STOPPED)
+    async def test_the_status_time_is_the_players_elapsed_time(
+        self, state: PlayerState, dummy_player: SlimClient
+    ) -> None:
+        """The status time is int(elapsed_seconds) unless the player is stopped."""
+        player = _status_player(
+            dummy_player,
+            state=state,
+            elapsed_seconds=41.9,
+            current_media=_media(title="Song", duration=200),
+        )
+        assert (await _status(player))["time"] == 41
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_player_reports_zero_unlike_before(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """The one difference: upstream kept the last elapsed time, LMS reports zero."""
+        player = _status_player(
+            dummy_player,
+            state=PlayerState.STOPPED,
+            elapsed_seconds=41.9,
+            current_media=_media(title="Song", duration=200),
+        )
+        assert (await _status(player))["time"] == 0
+
+
+class TestCorrectedElapsedSeconds:
+    """The elapsed time is corrected by the metadata's elapsed_offset after a seek."""
+
+    @staticmethod
+    def _player(
+        state: PlayerState, metadata: dict | None, elapsed: float
+    ) -> SimpleNamespace:
+        media = SimpleNamespace(metadata=metadata) if metadata is not None else None
+        return SimpleNamespace(
+            state=state,
+            current_media=media,
+            elapsed_seconds=elapsed,
+            player_id="p1",
+        )
+
+    def _corrected(self, player: SimpleNamespace) -> float:
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli._pending_seeks = self.pending  # noqa: SLF001
+        return cli._corrected_elapsed_seconds(  # noqa: SLF001
+            cast("SlimClient", player)
+        )
+
+    def setup_method(self) -> None:
+        """Start every test without a pending seek."""
+        self.pending: dict[str, tuple[int, object, float]] = {}
+
+    def test_offset_is_added_to_the_stream_position(self) -> None:
+        """A stream that restarted at zero reports the real position in the track."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 90}, 5)
+        assert self._corrected(player) == 95
+
+    def test_missing_or_empty_offset_means_zero(self) -> None:
+        """Without the field the stream position is the track position."""
+        no_key = self._player(PlayerState.PLAYING, {"duration": 200}, 5)
+        none_value = self._player(PlayerState.PLAYING, {"elapsed_offset": None}, 5)
+        no_media = self._player(PlayerState.PLAYING, None, 5)
+        for player in (no_key, none_value, no_media):
+            result = self._corrected(player)
+            assert result == 5
+
+    def test_a_requested_seek_shows_its_target_until_the_new_stream_starts(
+        self,
+    ) -> None:
+        """The target applies from the request on, before a new stream is asked for."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
+        self.pending["p1"] = (86, player.current_media, time.monotonic())
+        assert self._corrected(player) == 86
+        # the new stream started: current_media is a different object
+        player.current_media = SimpleNamespace(metadata={"elapsed_offset": 86})
+        player.elapsed_seconds = 1
+        assert self._corrected(player) == 87
+        assert "p1" not in self.pending
+
+    def test_a_requested_seek_that_never_starts_a_stream_times_out(self) -> None:
+        """If the stream never restarts, the real position is shown again."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
+        started = time.monotonic() - SEEK_PENDING_SECONDS - 1
+        self.pending["p1"] = (86, player.current_media, started)
+        assert self._corrected(player) == 6
+        assert "p1" not in self.pending
+
+    def test_set_pending_position_applies_until_the_stream_starts(self) -> None:
+        """The hook shows the position at once, and stops once current_media changes."""
+        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 40}, 3)
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli._pending_seeks = self.pending  # noqa: SLF001
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli.set_pending_position("p1", 70.4)
+        assert self._corrected(player) == 70
+        player.current_media = SimpleNamespace(metadata={"elapsed_offset": 70})
+        player.elapsed_seconds = 2
+        assert self._corrected(player) == 72
+
+    def test_stopped_player_reports_zero(self) -> None:
+        """After a track ends the elapsed time is zero, as on LMS."""
+        player = self._player(PlayerState.STOPPED, {"elapsed_offset": 90}, 5)
+        assert self._corrected(player) == 0
