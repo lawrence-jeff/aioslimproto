@@ -235,6 +235,10 @@ class MediaMetadata(TypedDict):
     title: str  # optional
     image_url: str  # optional
     duration: int  # optional
+    # Seconds into the track at which this stream's position 0 sits: after a seek the
+    # stream restarts at zero, and cli.py adds this to the elapsed time it reports.
+    # Optional: absent means 0.
+    elapsed_offset: float
     type: str  # optional
     bitrate: str  # optional
     samplerate: str  # optional
