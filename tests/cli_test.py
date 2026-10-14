@@ -1162,6 +1162,61 @@ class TestTimeCommand:
         assert player.player_id == "p1"
 
 
+class TestPositionForAHostThatUsesNoHooks:
+    """Without elapsed_offset and set_pending_position, the position is the player's."""
+
+    NOT_STOPPED = (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.BUFFERING)
+
+    @staticmethod
+    def _cli(state: PlayerState, elapsed: float, metadata: dict) -> SlimProtoCLI:
+        player = SimpleNamespace(
+            player_id="p1",
+            state=state,
+            current_media=SimpleNamespace(metadata=metadata),
+            elapsed_seconds=elapsed,
+        )
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli._pending_seeks = {}  # noqa: SLF001
+        return cli
+
+    @pytest.mark.parametrize("state", NOT_STOPPED)
+    @pytest.mark.parametrize("metadata", [{}, {"duration": 200}])
+    def test_the_position_query_is_the_players_elapsed_time(
+        self, state: PlayerState, metadata: dict
+    ) -> None:
+        """`time ?` answers int(elapsed_seconds), as before the offset existed."""
+        cli = self._cli(state, 41.9, metadata)
+        assert cli._handle_time("p1", "?") == 41  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", NOT_STOPPED)
+    async def test_the_status_time_is_the_players_elapsed_time(
+        self, state: PlayerState, dummy_player: SlimClient
+    ) -> None:
+        """The status time is int(elapsed_seconds) unless the player is stopped."""
+        player = _status_player(
+            dummy_player,
+            state=state,
+            elapsed_seconds=41.9,
+            current_media=_media(title="Song", duration=200),
+        )
+        assert (await _status(player))["time"] == 41
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_player_reports_zero_unlike_before(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """The one difference: upstream kept the last elapsed time, LMS reports zero."""
+        player = _status_player(
+            dummy_player,
+            state=PlayerState.STOPPED,
+            elapsed_seconds=41.9,
+            current_media=_media(title="Song", duration=200),
+        )
+        assert (await _status(player))["time"] == 0
+
+
 class TestCorrectedElapsedSeconds:
     """The elapsed time is corrected by the metadata's elapsed_offset after a seek."""
 
