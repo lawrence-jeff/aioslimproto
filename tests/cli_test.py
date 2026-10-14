@@ -393,6 +393,41 @@ class TestStatusResponse:
         assert status["duration"] == 0
 
     @pytest.mark.asyncio
+    async def test_the_menu_status_has_no_item_loop_when_nothing_is_loaded(
+        self, dummy_player: SlimClient
+    ) -> None:
+        """Clients read item_loop[1] when the key exists, so an empty one is omitted."""
+        status = await _status(_status_player(dummy_player, presets=[]), menu="menu")
+        assert "item_loop" not in status
+        assert status["count"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("current", "following", "expected"),
+        [
+            ("Song", None, ["Song"]),
+            ("Song", "Next", ["Song", "Next"]),
+            (None, "Next", ["Next"]),
+        ],
+    )
+    async def test_the_menu_status_lists_the_current_and_next_track(
+        self,
+        dummy_player: SlimClient,
+        current: str | None,
+        following: str | None,
+        expected: list[str],
+    ) -> None:
+        """item_loop holds the track that is loaded and the one queued after it."""
+        player = _status_player(
+            dummy_player,
+            current_media=_media(title=current) if current else None,
+            next_media=_media(title=following) if following else None,
+            presets=[],
+        )
+        status = await _status(player, menu="menu")
+        assert [item["text"] for item in status["item_loop"]] == expected
+
+    @pytest.mark.asyncio
     async def test_nothing_loaded_sends_no_song_fields(
         self, dummy_player: SlimClient
     ) -> None:
