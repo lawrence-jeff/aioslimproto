@@ -920,6 +920,12 @@ class SlimProtoCLI:
         starts a stream) is how far into the track that position 0 is; adding it gives the real
         position. Returns 0 when STOPPED, as LMS does after a track finishes.
         """
+        # Without this a stopped player's screen keeps the position it had: the player's own
+        # reports reset it to 0 about two seconds after the stop, but nothing pushes that
+        # to the client, and after a seek the reset leaves the seek point. This only
+        # changes what is shown: Play afterwards resumes where MA saved the position at
+        # the stop, not at 0. Unlike the offset and pending seek below it changes the
+        # default for every host, so it stays out of an upstream change for those hooks.
         if player.state == PlayerState.STOPPED:
             return 0
         # A client that asked for a seek is shown the target from that moment until the new
