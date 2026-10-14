@@ -9,7 +9,7 @@ import logging
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Self
 
-from .cli import SlimProtoCLI
+from .cli import SlimProtoCLI, SlimRouteHandler
 from .client import SlimClient
 from .const import SLIMPROTO_PORT
 from .discovery import start_discovery
@@ -34,7 +34,7 @@ class SlimServer:
         name: str | None = None,
         control_port: int = SLIMPROTO_PORT,
         cli_command_handler: SlimCLICommandHandler | None = None,
-        extra_routes: dict[str, Callable] | None = None,
+        extra_routes: dict[str, SlimRouteHandler] | None = None,
     ) -> None:
         """
         Initialize SlimServer instance.
@@ -52,8 +52,11 @@ class SlimServer:
           The handler can raise NotImplementedError for commands it doesn't support, then the fallback will be used.
         - extra_routes: Optional dict of {path: handler} to register on the same internal
           webapp as /cometd and /jsonrpc.js (e.g. for a consuming application's own icon/
-          artwork serving). Must be passed here, not added after start() - the router is
-          frozen as part of starting and aiohttp raises if you try to add routes after that.
+          artwork serving). Paths use aiohttp's syntax and the handlers get every HTTP
+          method. They are registered in dict order and aiohttp matches in registration
+          order, so a catch-all path must come last. Must be passed here, not added after
+          start() - the router is frozen as part of starting and aiohttp raises if you try
+          to add routes after that.
         """  # noqa: E501
         self.logger = logging.getLogger(__name__)
         self.ip_address = ip_address or get_ip()

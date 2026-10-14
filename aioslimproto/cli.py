@@ -89,6 +89,8 @@ class SlimCLICommand:
 SlimCLICommandHandler = Callable[
     [SlimCLICommand], SlimCLICommandResponse | Awaitable[SlimCLICommandResponse]
 ]
+# An aiohttp handler for a route a consuming application adds to the CLI web server
+SlimRouteHandler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
 
 @dataclass
@@ -171,7 +173,7 @@ class SlimProtoCLI:
         cli_port: int | None = None,
         cli_port_json: int | None = 0,
         command_handler: SlimCLICommandHandler | None = None,
-        extra_routes: dict[str, Callable] | None = None,
+        extra_routes: dict[str, SlimRouteHandler] | None = None,
     ) -> None:
         """
         Initialize Telnet and/or Json interface CLI.
