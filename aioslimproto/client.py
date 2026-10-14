@@ -303,11 +303,17 @@ class SlimClient:
         """Send play/unpause command to player."""
         if self._state != PlayerState.PAUSED:
             return
-        await self._send_strm(b"u", flags=0)
-        # the position counts on from here, not from the last report before the pause
+        # the position counts on from here, not from the last report before the pause;
+        # set before the send so an STMr that arrives meanwhile is not taken for a
+        # resume the player made itself
         self._last_timestamp = time.time()
         # some players do not update their state by event so we force it here
         self._state = PlayerState.PLAYING
+        try:
+            await self._send_strm(b"u", flags=0)
+        except BaseException:
+            self._state = PlayerState.PAUSED
+            raise
         self.signal_update()
 
     async def pause(self) -> None:
