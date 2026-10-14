@@ -780,6 +780,47 @@ class TestCometDStaleSession:
         assert response[0]["advice"]["reconnect"] == "handshake"
 
 
+class TestTimeCommand:
+    """The time command reports the position; a seek is left to the application."""
+
+    @staticmethod
+    def _cli() -> tuple[SlimProtoCLI, SimpleNamespace]:
+        player = SimpleNamespace(
+            player_id="p1",
+            state=PlayerState.PLAYING,
+            current_media=SimpleNamespace(metadata={"elapsed_offset": 60}),
+            elapsed_seconds=5,
+        )
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        cli._pending_seeks = {}  # noqa: SLF001
+        return cli, player
+
+    def test_the_position_query_is_corrected_for_a_restarted_stream(self) -> None:
+        """A seeked stream restarted at zero still reports the position in the track."""
+        cli, _player = self._cli()
+        assert cli._handle_time("p1", "?") == 65  # noqa: SLF001
+
+    def test_a_seek_is_not_handled_by_the_library(self) -> None:
+        """Seeking needs a new stream, so it raises NotImplementedError, as upstream."""
+        cli, _player = self._cli()
+        with pytest.raises(NotImplementedError):
+            cli._handle_time("p1", 90)  # noqa: SLF001
+
+    def test_a_pending_position_can_be_set_and_cleared(self) -> None:
+        """The application sets the position a seek will land on, and may undo it."""
+        cli, player = self._cli()
+        cli.set_pending_position("p1", 90.6)
+        assert cli._handle_time("p1", "?") == 90  # noqa: SLF001
+        cli.set_pending_position("p1", None)
+        assert cli._handle_time("p1", "?") == 65  # noqa: SLF001
+        # an unknown player is ignored
+        cli.server = SimpleNamespace(get_player=lambda _id: None)  # type: ignore[assignment]
+        cli.set_pending_position("nobody", 10)
+        assert "nobody" not in cli._pending_seeks  # noqa: SLF001
+        assert player.player_id == "p1"
+
+
 class TestCorrectedElapsedSeconds:
     """The elapsed time is corrected by the metadata's elapsed_offset after a seek."""
 

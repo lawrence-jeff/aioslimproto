@@ -164,9 +164,6 @@ class SlimProtoCLI:
     # Set by the provider after construction. Returns the display name for a player_id, or None if
     # it is not known. Independent of command_handler so the name works without the browse feature.
     display_name_lookup: Callable[[str], str | None] | None = None
-    # Set by the provider after construction: the host application, used for seek and play.
-    # Independent of command_handler so these work without browse.
-    mass: Any | None = None
 
     def __init__(
         self,
@@ -893,7 +890,7 @@ class SlimProtoCLI:
                 return name
         return player.name
 
-    def set_pending_position(self, player_id: str, seconds: float) -> None:
+    def set_pending_position(self, player_id: str, seconds: float | None) -> None:
         """
         Report a position for a player until the stream it is about to start has started.
 
@@ -902,9 +899,12 @@ class SlimProtoCLI:
         from that moment, instead of the old one.
 
         :param player_id: The player that is going to start the stream.
-        :param seconds: The position in the track the new stream starts at.
+        :param seconds: The position in the track the new stream starts at, or None to
+            stop reporting one (for example when the stream could not be started).
         """
-        if player := self.server.get_player(player_id):
+        if seconds is None:
+            self._pending_seeks.pop(player_id, None)
+        elif player := self.server.get_player(player_id):
             self._pending_seeks[player_id] = (
                 int(seconds),
                 player.current_media,
@@ -1170,7 +1170,7 @@ class SlimProtoCLI:
             return int(player.muted)
         raise NotImplementedError(f"No handler for mixer/{subcommand}")
 
-    async def _handle_time(self, player_id: str, number: str | int) -> int | None:
+    def _handle_time(self, player_id: str, number: str | int) -> int | None:
         """Handle player `time` command."""
         # <playerid> time <number|-number|+number|?>
         # The "time" command allows you to query the current number of seconds that the
@@ -1183,24 +1183,7 @@ class SlimProtoCLI:
             return None
         if number == "?":
             return int(self._corrected_elapsed_seconds(player))
-        # player_queues.seek(queue_id, position) takes an absolute position in seconds (queue_id is
-        # the player_id). Relative seeks (+N/-N) are resolved against the corrected elapsed position
-        # (see _corrected_elapsed_seconds), since the seek has no relative form and the raw position
-        # is relative to the current stream.
-        text = str(number)
-        if text and text[0] in "+-":
-            target = int(self._corrected_elapsed_seconds(player)) + int(text)
-        else:
-            target = int(number)
-        # The host application is reached through the provider's command handler
-        # (self.command_handler.mass); neither SlimProtoCLI nor the SlimClient has .mass.
-        self.set_pending_position(player_id, target)
-        try:
-            await self.mass.player_queues.seek(queue_id=player_id, position=target)
-        except Exception:
-            self._pending_seeks.pop(player_id, None)
-            raise
-        return None
+        raise NotImplementedError("No handler for seek")
 
     async def _handle_power(
         self,
@@ -1228,14 +1211,9 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """
-        Handle player `play` command.
-
-        Uses the host's player_queues.play(), not SlimClient.play(): the latter only acts when
-        paused, so it silently does nothing once a track has ended (STOPPED). The host's play()
-        handles both the paused and stopped cases.
-        """
-        await self.mass.player_queues.play(queue_id=player_id)
+        """Handle player `play` command."""
+        if player := self.server.get_player(player_id):
+            await player.play()
 
     async def _handle_stop(
         self,
@@ -1254,18 +1232,12 @@ class SlimProtoCLI:
         *args,
         **kwargs,
     ) -> None:
-        """
-        Handle the player `pause` command, which toggles play/pause.
-
-        Like _handle_play, the "not currently playing" branch uses the host's play() instead of the
-        low-level player.play(), which is a no-op unless paused, so toggling after a track ended
-        (STOPPED, not PAUSED) did nothing.
-        """
+        """Handle player `stop` command."""
         if player := self.server.get_player(player_id):
             if player.state == PlayerState.PLAYING:
                 await player.pause()
             else:
-                await self.mass.player_queues.play(queue_id=player_id)
+                await player.play()
 
     async def _handle_mode(
         self,
