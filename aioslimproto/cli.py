@@ -1544,26 +1544,24 @@ class SlimProtoCLI:
         a plain {"display": {...}} dict, matching what a normal displaystatus response
         would carry.
         """
-        client = next(
-            (x for x in self._cometd_clients.values() if x.player_id == player_id),
-            None,
-        )
-        if not client:
-            return
-        sub = client.slim_subscriptions.get(
-            f"/{client.client_id}/slim/displaystatus/{player_id}",
-        )
-        if not sub:
-            return
-        with suppress(asyncio.QueueFull):
-            client.queue.put_nowait(
-                {
-                    "channel": sub["data"]["response"],
-                    "id": sub["id"],
-                    "data": {"display": display},
-                    "ext": {"priority": sub["data"].get("priority")},
-                },
+        # a reconnected client can leave an older session listed, so use the session
+        # that holds the subscription, not just the first one for the player
+        for client in self._cometd_clients.values():
+            sub = client.slim_subscriptions.get(
+                f"/{client.client_id}/slim/displaystatus/{player_id}",
             )
+            if client.player_id != player_id or not sub:
+                continue
+            with suppress(asyncio.QueueFull):
+                client.queue.put_nowait(
+                    {
+                        "channel": sub["data"]["response"],
+                        "id": sub["id"],
+                        "data": {"display": display},
+                        "ext": {"priority": sub["data"].get("priority")},
+                    },
+                )
+            return
 
     async def _do_periodic(self) -> None:
         """Execute periodic sending of state and cleanup."""

@@ -612,6 +612,20 @@ class TestPushPopups:
         cli.push_show_briefly("someone-else", ["Adding", "A Song"])
         assert client.queue.empty()
 
+    def test_a_session_with_the_subscription_gets_the_popup_not_an_older_one(
+        self, dummy_server: SlimServer
+    ) -> None:
+        """A reconnect can leave an older session listed first for the same player."""
+        cli, newer = self._cli_with_subscription(dummy_server)
+        older = CometDClient(client_id="c0", player_id="a5:41:d2:cd:cd:05")
+        cli._cometd_clients = {"c0": older, **cli._cometd_clients}  # noqa: SLF001
+        cli.push_show_briefly("a5:41:d2:cd:cd:05", ["Adding", "A Song"])
+        assert older.queue.empty()
+        assert newer.queue.get_nowait()["data"]["display"]["text"] == [
+            "Adding",
+            "A Song",
+        ]
+
     def test_a_full_queue_drops_the_popup_without_failing(
         self, dummy_server: SlimServer
     ) -> None:
