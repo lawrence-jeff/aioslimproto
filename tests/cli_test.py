@@ -1248,10 +1248,10 @@ class TestStatusResponse:
         assert "waitingToPlay" not in status
 
     @pytest.mark.asyncio
-    async def test_a_track_sends_rate_time_duration_and_can_seek(
+    async def test_a_track_sends_time_and_duration(
         self, dummy_player: SlimClient
     ) -> None:
-        """A loaded track with a duration can be seeked and has a running clock."""
+        """A loaded track has a running clock and a length."""
         player = _status_player(
             dummy_player,
             state=PlayerState.PLAYING,
@@ -1260,24 +1260,10 @@ class TestStatusResponse:
         )
         status = await _status(player)
         assert status["mode"] == "play"
-        assert status["rate"] == 1
         assert status["time"] == 12
         assert status["duration"] == 200
-        assert status["can_seek"] == 1
         assert status["playlist_cur_index"] == 0
         assert status["playlist_tracks"] == 1
-
-    @pytest.mark.asyncio
-    async def test_a_track_without_a_duration_cannot_be_seeked(
-        self, dummy_player: SlimClient
-    ) -> None:
-        """can_seek is only ever sent as 1, and only when there is a duration."""
-        player = _status_player(
-            dummy_player, current_media=_media(title="Stream", duration=0)
-        )
-        status = await _status(player)
-        assert "can_seek" not in status
-        assert status["duration"] == 0
 
     @pytest.mark.asyncio
     async def test_the_menu_status_has_no_item_loop_when_nothing_is_loaded(
@@ -1320,7 +1306,7 @@ class TestStatusResponse:
     ) -> None:
         """With nothing in the queue there is no track, position or index."""
         status = await _status(dummy_player)
-        for key in ("rate", "time", "duration", "can_seek", "playlist_cur_index"):
+        for key in ("time", "duration", "playlist_cur_index"):
             assert key not in status
         assert status["playlist_loop"] == []
 
