@@ -915,14 +915,6 @@ class SlimProtoCLI:
 
     def _corrected_elapsed_seconds(self, player: SlimClient) -> float:
         """Return the elapsed seconds, corrected for a seek that restarted the stream at 0."""
-        # Without this a stopped player's screen keeps the position it had: the player's own
-        # reports reset it to 0 about two seconds after the stop, but nothing pushes that
-        # to the client, and after a seek the reset leaves the seek point. This only
-        # changes what is shown: Play afterwards resumes where MA saved the position at
-        # the stop, not at 0. Unlike the offset and pending seek below it changes the
-        # default for every host, so it stays out of an upstream change for those hooks.
-        if player.state == PlayerState.STOPPED:
-            return 0
         if pending := self._pending_seeks.get(player.player_id):
             target, media_at_seek, started = pending
             if (
@@ -1010,6 +1002,13 @@ class SlimProtoCLI:
             ],
             **player.extra_data,
         }
+        # A stopped player reports position 0, as LMS does. Without it the client keeps
+        # showing the position it had: the player's own reports reset it to 0 about two
+        # seconds after the stop, but nothing pushes that to the client, and after a seek
+        # the reset leaves the seek point. Play afterwards resumes where MA saved the
+        # position, so this only changes what is shown while stopped.
+        if player.state == PlayerState.STOPPED and "time" in result:
+            result["time"] = 0
 
         # additional details if menu requested
         if menu == "menu":
@@ -1184,6 +1183,8 @@ class SlimProtoCLI:
         if not player:
             return None
         if number == "?":
+            if player.state == PlayerState.STOPPED:
+                return 0
             return int(self._corrected_elapsed_seconds(player))
         raise NotImplementedError("No handler for seek")
 

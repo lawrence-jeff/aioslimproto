@@ -1670,6 +1670,9 @@ class TestCorrectedElapsedSeconds:
         assert self._corrected(player) == 72
 
     def test_stopped_player_reports_zero(self) -> None:
-        """After a track ends the elapsed time is zero, as on LMS."""
+        """After a track ends the position query answers zero, as on LMS."""
         player = self._player(PlayerState.STOPPED, {"elapsed_offset": 90}, 5)
-        assert self._corrected(player) == 0
+        cli = SlimProtoCLI.__new__(SlimProtoCLI)
+        cli._pending_seeks = self.pending  # noqa: SLF001
+        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
+        assert cli._handle_time("p1", "?") == 0  # noqa: SLF001
