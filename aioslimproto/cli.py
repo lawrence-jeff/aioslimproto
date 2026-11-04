@@ -975,15 +975,7 @@ class SlimProtoCLI:
                     "remote": 1,
                     "current_title": self.server.name,
                     "time": int(self._corrected_elapsed_seconds(player)),
-                    # Hardcoded to 1 like LMS. The client multiplies by it when
-                    # correcting the elapsed time, so a missing rate breaks the Now
-                    # Playing elapsed/remaining display entirely.
-                    "rate": 1,
-                    "duration": (_duration := cur_item.metadata.get("duration", 0)),
-                    # Only sent (as 1) when the item can be seeked, never as 0, like waitingToPlay.
-                    # Gated on _duration because seeking an item without a duration is refused. The
-                    # client reads this to enable the Now Playing progress slider.
-                    **({"can_seek": 1} if _duration else {}),
+                    "duration": cur_item.metadata.get("duration", 0),
                 }
                 if cur_item
                 else {}
