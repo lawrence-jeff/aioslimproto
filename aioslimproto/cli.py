@@ -151,9 +151,8 @@ def parse_args(raw_values: list[SlimCLIScalar]) -> tuple[ArgsType, KwargsType]:
     return (args, kwargs)
 
 
-# How long a requested seek's target is shown before the position is read from the player
-# again, in case the new stream never starts.
-SEEK_PENDING_SECONDS = 12.0
+# How long a requested seek's target is shown if the new stream never starts
+SEEK_PENDING_SECONDS = 10.0
 
 
 class SlimProtoCLI:
@@ -187,8 +186,6 @@ class SlimProtoCLI:
         self.command_handler = command_handler
         self.extra_routes = extra_routes or {}
         self._cometd_clients: dict[str, CometDClient] = {}
-        # seeks asked for by a client whose new stream has not started yet:
-        # player_id -> (target seconds, current_media at the time, monotonic start)
         self._pending_seeks: dict[str, tuple[int, Any, float]] = {}
         self._player_map: dict[str, str] = {}
         self._apprunner: web.AppRunner | None = None
@@ -888,19 +885,18 @@ class SlimProtoCLI:
 
     def set_pending_position(self, player_id: str, seconds: float | None) -> None:
         """
-        Report a position for a player until the stream it is about to start has started.
+        Report a seek's target position until the new stream has started.
 
-        Call it before asking a player to start a stream at a position other than the
-        one it reports now (a seek, or a new track). The position is shown to the clients
-        from that moment, instead of the old one.
+        Without it the progress bar jumps back to the old position or to 0 while the seek is
+        in flight.
 
         :param player_id: The player that is going to start the stream.
-        :param seconds: The position in the track the new stream starts at, or None to
-            stop reporting one (for example when the stream could not be started).
+        :param seconds: The position the new stream starts at, or None to stop reporting one.
         """
         if seconds is None:
             self._pending_seeks.pop(player_id, None)
         elif player := self.server.get_player(player_id):
+            # (target seconds, current_media now, start time): a new current_media ends it
             self._pending_seeks[player_id] = (
                 int(seconds),
                 player.current_media,
@@ -908,14 +904,7 @@ class SlimProtoCLI:
             )
 
     def _corrected_elapsed_seconds(self, player: SlimClient) -> float:
-        """
-        Return the elapsed seconds corrected for the seeked stream's position-0 restart.
-
-        After a seek the stream restarts at position zero, so elapsed_seconds is relative to the
-        new, shorter stream. MediaMetadata.elapsed_offset (set by the host application when it
-        starts a stream) is how far into the track that position 0 is; adding it gives the real
-        position. Returns 0 when STOPPED, as LMS does after a track finishes.
-        """
+        """Return the elapsed seconds, corrected for a seek that restarted the stream at 0."""
         # Without this a stopped player's screen keeps the position it had: the player's own
         # reports reset it to 0 about two seconds after the stop, but nothing pushes that
         # to the client, and after a seek the reset leaves the seek point. This only
@@ -924,9 +913,6 @@ class SlimProtoCLI:
         # default for every host, so it stays out of an upstream change for those hooks.
         if player.state == PlayerState.STOPPED:
             return 0
-        # A client that asked for a seek is shown the target from that moment until the new
-        # stream starts: the status pushes the seek itself triggers come before the new stream
-        # is requested, and the player reports position 0 of it before it is confirmed started.
         if pending := self._pending_seeks.get(player.player_id):
             target, media_at_seek, started = pending
             if (
@@ -935,7 +921,7 @@ class SlimProtoCLI:
             ):
                 return target
             del self._pending_seeks[player.player_id]
-        offset = 0
+        offset: float = 0
         if player.current_media and player.current_media.metadata:
             offset = player.current_media.metadata.get("elapsed_offset", 0) or 0
         return player.elapsed_seconds + offset
