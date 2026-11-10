@@ -13,8 +13,8 @@ from urllib.parse import quote
 import pytest
 
 from aioslimproto.cli import (
-    SEEK_PENDING_SECONDS,
     CometDClient,
+    SlimCLICommand,
     SlimProtoCLI,
     _drop_empty_quality_fields,
     playlist_item_from_media_details,
@@ -77,6 +77,8 @@ def dummy_player() -> SlimClient:
             extra_data={"uuid": "player-uuid-1", "seq_no": 1},
             device_address="127.0.0.1",
             current_media=None,
+            buffering_media=None,
+            awaiting_stream_start=False,
             next_media=None,
             presets=[],
             elapsed_seconds=0,
@@ -1209,12 +1211,17 @@ class TestTimeCommand:
         player = SimpleNamespace(
             player_id="p1",
             state=PlayerState.PLAYING,
-            current_media=SimpleNamespace(metadata={"elapsed_offset": 60}),
+            current_media=SimpleNamespace(
+                metadata={"elapsed_offset": 60, "duration": 200}
+            ),
+            buffering_media=None,
+            awaiting_stream_start=False,
             elapsed_seconds=5,
         )
         cli = SlimProtoCLI.__new__(SlimProtoCLI)
         cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
-        cli._pending_seeks = {}  # noqa: SLF001
+        cli.command_handler = None
+        cli._seek_targets = {}  # noqa: SLF001
         return cli, player
 
     def test_the_position_query_is_corrected_for_a_restarted_stream(self) -> None:
@@ -1228,22 +1235,94 @@ class TestTimeCommand:
         with pytest.raises(NotImplementedError):
             cli._handle_time("p1", 90)  # noqa: SLF001
 
-    def test_a_pending_position_can_be_set_and_cleared(self) -> None:
-        """The application sets the position a seek will land on, and may undo it."""
-        cli, player = self._cli()
-        cli.set_pending_position("p1", 90.6)
-        assert cli._handle_time("p1", "?") == 90  # noqa: SLF001
-        cli.set_pending_position("p1", None)
+    @staticmethod
+    def _command(*args: object) -> SlimCLICommand:
+        return SlimCLICommand(
+            command="time", player_id="p1", args=list(args), kwargs={}
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("argument", "target"),
+        [(90, 90), ("90", 90), ("+10", 75), ("-10", 55), ("-500", 0), (999, 200)],
+    )
+    async def test_a_seek_shows_its_target_while_the_host_carries_it_out(
+        self, argument: object, target: int
+    ) -> None:
+        """The position asked for is reported until the host's handler returns."""
+        cli, _player = self._cli()
+        seen: list[int | None] = []
+
+        async def handler(_command: SlimCLICommand) -> None:
+            seen.append(cli._handle_time("p1", "?"))  # noqa: SLF001
+
+        cli.command_handler = handler
+        await cli._dispatch_command(self._command(argument))  # noqa: SLF001
+        assert seen == [target]
+
+    @pytest.mark.asyncio
+    async def test_the_target_is_cleared_once_the_host_is_done(self) -> None:
+        """Afterwards the position is the one the player reports."""
+        cli, _player = self._cli()
+        cli.command_handler = AsyncMock(return_value=None)
+        await cli._dispatch_command(self._command(90))  # noqa: SLF001
+        assert cli._seek_targets == {}  # noqa: SLF001
         assert cli._handle_time("p1", "?") == 65  # noqa: SLF001
-        # an unknown player is ignored
-        cli.server = SimpleNamespace(get_player=lambda _id: None)  # type: ignore[assignment]
-        cli.set_pending_position("nobody", 10)
-        assert "nobody" not in cli._pending_seeks  # noqa: SLF001
-        assert player.player_id == "p1"
+
+    @pytest.mark.asyncio
+    async def test_the_target_is_cleared_when_the_host_fails(self) -> None:
+        """A seek that raises does not leave a position behind."""
+        cli, _player = self._cli()
+        cli.command_handler = AsyncMock(side_effect=RuntimeError("refused"))
+        with pytest.raises(RuntimeError):
+            await cli._dispatch_command(self._command(90))  # noqa: SLF001
+        assert cli._seek_targets == {}  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_an_older_seek_does_not_clear_a_newer_one(self) -> None:
+        """Overlapping seeks (a drag): the last one asked for is the one shown."""
+        cli, _player = self._cli()
+        release_first = asyncio.Event()
+        started = asyncio.Event()
+        calls = 0
+        seen: list[int | None] = []
+
+        async def handler(_command: SlimCLICommand) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                started.set()
+                await release_first.wait()
+            else:
+                release_first.set()
+                await asyncio.sleep(0)
+                seen.append(cli._handle_time("p1", "?"))  # noqa: SLF001
+
+        cli.command_handler = handler
+        first = asyncio.create_task(cli._dispatch_command(self._command(90)))  # noqa: SLF001
+        await started.wait()
+        await cli._dispatch_command(self._command(120))  # noqa: SLF001
+        await first
+        assert seen == [120]
+        assert cli._seek_targets == {}  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_a_query_or_an_invalid_seek_sets_no_target(self) -> None:
+        """Only a seek to a position sets a target."""
+        cli, _player = self._cli()
+        seen: list[dict] = []
+
+        async def handler(_command: SlimCLICommand) -> None:
+            seen.append(dict(cli._seek_targets))  # noqa: SLF001
+
+        cli.command_handler = handler
+        for argument in ("?", "soon", "12.5"):
+            await cli._dispatch_command(self._command(argument))  # noqa: SLF001
+        assert seen == [{}, {}, {}]
 
 
 class TestPositionForAHostThatUsesNoHooks:
-    """Without elapsed_offset and set_pending_position, the position is the player's."""
+    """Without elapsed_offset and a seek, the position is the player's."""
 
     @staticmethod
     def _cli(state: PlayerState, elapsed: float, metadata: dict) -> SlimProtoCLI:
@@ -1251,11 +1330,13 @@ class TestPositionForAHostThatUsesNoHooks:
             player_id="p1",
             state=state,
             current_media=SimpleNamespace(metadata=metadata),
+            buffering_media=None,
+            awaiting_stream_start=False,
             elapsed_seconds=elapsed,
         )
         cli = SlimProtoCLI.__new__(SlimProtoCLI)
         cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
-        cli._pending_seeks = {}  # noqa: SLF001
+        cli._seek_targets = {}  # noqa: SLF001
         return cli
 
     @pytest.mark.parametrize("state", list(PlayerState))
@@ -1289,26 +1370,36 @@ class TestCorrectedElapsedSeconds:
 
     @staticmethod
     def _player(
-        state: PlayerState, metadata: dict | None, elapsed: float
+        state: PlayerState,
+        metadata: dict | None,
+        elapsed: float,
+        buffering: dict | None = None,
+        *,
+        awaiting: bool = False,
     ) -> SimpleNamespace:
         media = SimpleNamespace(metadata=metadata) if metadata is not None else None
+        buffering_media = (
+            SimpleNamespace(metadata=buffering) if buffering is not None else None
+        )
         return SimpleNamespace(
             state=state,
             current_media=media,
+            buffering_media=buffering_media,
+            awaiting_stream_start=awaiting,
             elapsed_seconds=elapsed,
             player_id="p1",
         )
 
     def _corrected(self, player: SimpleNamespace) -> float:
         cli = SlimProtoCLI.__new__(SlimProtoCLI)
-        cli._pending_seeks = self.pending  # noqa: SLF001
+        cli._seek_targets = self.pending  # noqa: SLF001
         return cli._corrected_elapsed_seconds(  # noqa: SLF001
             cast("SlimClient", player)
         )
 
     def setup_method(self) -> None:
-        """Start every test without a pending seek."""
-        self.pending: dict[str, tuple[int, object, float]] = {}
+        """Start every test without a seek target."""
+        self.pending: dict[str, tuple[object, int]] = {}
 
     def test_offset_is_added_to_the_stream_position(self) -> None:
         """A stream that restarted at zero reports the real position in the track."""
@@ -1323,35 +1414,26 @@ class TestCorrectedElapsedSeconds:
         for player in (no_key, none_value, no_media):
             assert self._corrected(player) == 5
 
-    def test_a_requested_seek_shows_its_target_until_the_new_stream_starts(
-        self,
-    ) -> None:
-        """The target applies from the request on, before a new stream is asked for."""
+    def test_a_seek_target_is_shown_instead_of_the_players_position(self) -> None:
+        """During a seek the target is reported, afterwards the real position."""
         player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
-        self.pending["p1"] = (86, player.current_media, time.monotonic())
+        self.pending["p1"] = (object(), 86)
         assert self._corrected(player) == 86
-        # the new stream started: current_media is a different object
+        self.pending.clear()
+        assert self._corrected(player) == 6
+
+    def test_a_new_stream_that_has_not_started_uses_its_own_offset(self) -> None:
+        """Until the new stream starts, the old clock gets the new stream offset."""
+        player = self._player(
+            PlayerState.PLAYING,
+            {"elapsed_offset": 10},
+            4,
+            buffering={"elapsed_offset": 86},
+            awaiting=True,
+        )
+        assert self._corrected(player) == 90
+        # once it has started the stream is current_media and the offset is its own
+        player.awaiting_stream_start = False
         player.current_media = SimpleNamespace(metadata={"elapsed_offset": 86})
         player.elapsed_seconds = 1
         assert self._corrected(player) == 87
-        assert "p1" not in self.pending
-
-    def test_a_requested_seek_that_never_starts_a_stream_times_out(self) -> None:
-        """If the stream never restarts, the real position is shown again."""
-        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 0}, 6)
-        started = time.monotonic() - SEEK_PENDING_SECONDS - 1
-        self.pending["p1"] = (86, player.current_media, started)
-        assert self._corrected(player) == 6
-        assert "p1" not in self.pending
-
-    def test_set_pending_position_applies_until_the_stream_starts(self) -> None:
-        """The hook shows the position at once, and stops once current_media changes."""
-        player = self._player(PlayerState.PLAYING, {"elapsed_offset": 40}, 3)
-        cli = SlimProtoCLI.__new__(SlimProtoCLI)
-        cli._pending_seeks = self.pending  # noqa: SLF001
-        cli.server = SimpleNamespace(get_player=lambda _id: player)  # type: ignore[assignment]
-        cli.set_pending_position("p1", 70.4)
-        assert self._corrected(player) == 70
-        player.current_media = SimpleNamespace(metadata={"elapsed_offset": 70})
-        player.elapsed_seconds = 2
-        assert self._corrected(player) == 72

@@ -149,10 +149,6 @@ def parse_args(raw_values: list[SlimCLIScalar]) -> tuple[ArgsType, KwargsType]:
     return (args, kwargs)
 
 
-# How long a requested seek's target is shown if the new stream never starts
-SEEK_PENDING_SECONDS = 10.0
-
-
 class SlimProtoCLI:
     """Basic implementation of CLI control for SlimProto players."""
 
@@ -181,8 +177,9 @@ class SlimProtoCLI:
         self.cli_port_json = cli_port_json
         self.logger = server.logger.getChild("cli")
         self.command_handler = command_handler
+        # the position a player was asked to seek to, while the host carries out the seek
+        self._seek_targets: dict[str, tuple[object, int]] = {}
         self._cometd_clients: dict[str, CometDClient] = {}
-        self._pending_seeks: dict[str, tuple[int, Any, float]] = {}
         self._player_map: dict[str, str] = {}
         self._apprunner: web.AppRunner | None = None
         self._webapp: web.Application | None = None
@@ -332,6 +329,30 @@ class SlimProtoCLI:
 
     async def _dispatch_command(self, slim_command: SlimCLICommand) -> Any:
         """Dispatch a command to the application handler, then the built-in fallback."""
+        player_id = slim_command.player_id
+        if (
+            slim_command.command == "time"
+            and player_id
+            and slim_command.args
+            and slim_command.args[0] != "?"
+            and (target := self._seek_target(player_id, slim_command.args[0]))
+            is not None
+        ):
+            # Until the host has carried out the seek, status pushes report where the player
+            # was asked to go. The old stream keeps playing until the host starts the new one,
+            # and a client keeps whatever position it received last (a progress bar that
+            # jumps back for the moment of a stale push).
+            token = object()
+            self._seek_targets[player_id] = (token, target)
+            try:
+                return await self._run_command(slim_command)
+            finally:
+                if self._seek_targets.get(player_id, (None, 0))[0] is token:
+                    del self._seek_targets[player_id]
+        return await self._run_command(slim_command)
+
+    async def _run_command(self, slim_command: SlimCLICommand) -> Any:
+        """Run a command with the application handler, then the built-in fallback."""
         if self.command_handler is not None:
             try:
                 result = self.command_handler(slim_command)
@@ -353,6 +374,25 @@ class SlimProtoCLI:
         if inspect.isawaitable(result):
             result = await result
         return result
+
+    def _seek_target(self, player_id: str, number: str | float) -> int | None:
+        """Return the position in seconds a `time` command seeks to, None if it is not valid."""
+        if not (player := self.server.get_player(player_id)):
+            return None
+        text = str(number).strip()
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        if text[:1] in "+-":
+            # relative to where the player is reported to be
+            value += int(self._corrected_elapsed_seconds(player))
+        duration = 0
+        if player.current_media and player.current_media.metadata:
+            duration = int(player.current_media.metadata.get("duration") or 0)
+        if duration:
+            value = min(value, duration)
+        return max(value, 0)
 
     def _publish_unhandled_command(self, slim_command: SlimCLICommand) -> None:
         """Publish an unhandled command to the addressed player, when available."""
@@ -877,39 +917,23 @@ class SlimProtoCLI:
             players.append(item)
         return PlayersResponse(count=len(players), players_loop=players)
 
-    def set_pending_position(self, player_id: str, seconds: float | None) -> None:
-        """
-        Report a seek's target position until the new stream has started.
-
-        Without it the progress bar jumps back to the old position or to 0 while the seek is
-        in flight.
-
-        :param player_id: The player that is going to start the stream.
-        :param seconds: The position the new stream starts at, or None to stop reporting one.
-        """
-        if seconds is None:
-            self._pending_seeks.pop(player_id, None)
-        elif player := self.server.get_player(player_id):
-            # (target seconds, current_media now, start time): a new current_media ends it
-            self._pending_seeks[player_id] = (
-                int(seconds),
-                player.current_media,
-                time.monotonic(),
-            )
-
     def _corrected_elapsed_seconds(self, player: SlimClient) -> float:
-        """Return the elapsed seconds, corrected for a seek that restarted the stream at 0."""
-        if pending := self._pending_seeks.get(player.player_id):
-            target, media_at_seek, started = pending
-            if (
-                player.current_media is media_at_seek
-                and time.monotonic() - started < SEEK_PENDING_SECONDS
-            ):
-                return target
-            del self._pending_seeks[player.player_id]
+        """
+        Return the elapsed seconds, corrected for a stream that starts part way into a track.
+
+        A player counts from the start of the stream it plays. A host that starts a stream
+        part way into a track (a seek) says where in `elapsed_offset` of the stream's metadata.
+        While a new stream is being started the offset is the one of that stream.
+        While the host carries out a seek the position asked for is reported.
+        """
+        if (pending := self._seek_targets.get(player.player_id)) is not None:
+            return float(pending[1])
+        media = player.current_media
+        if player.awaiting_stream_start and player.buffering_media:
+            media = player.buffering_media
         offset: float = 0
-        if player.current_media and player.current_media.metadata:
-            offset = player.current_media.metadata.get("elapsed_offset", 0) or 0
+        if media and media.metadata:
+            offset = media.metadata.get("elapsed_offset", 0) or 0
         return player.elapsed_seconds + offset
 
     async def _handle_status(
