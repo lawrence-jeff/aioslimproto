@@ -1084,6 +1084,40 @@ class TestStatusShape:
         assert status["waitingToPlay"] == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", [PlayerState.BUFFERING, PlayerState.BUFFER_READY])
+    async def test_waiting_to_play_is_left_out_while_the_current_track_plays_out(
+        self,
+        dummy_server: SlimServer,
+        dummy_player: SlimClient,
+        state: PlayerState,
+    ) -> None:
+        """A gapless handoff buffers the next track while the current one plays."""
+        dummy_player.state = state
+        dummy_player.current_media = self._media(duration=265)  # type: ignore[misc]
+        dummy_player.awaiting_stream_start = False  # type: ignore[misc]
+
+        status = await self._status(dummy_server, dummy_player)
+
+        assert "waitingToPlay" not in status
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", [PlayerState.BUFFERING, PlayerState.BUFFER_READY])
+    async def test_waiting_to_play_is_sent_while_a_new_stream_is_awaited(
+        self,
+        dummy_server: SlimServer,
+        dummy_player: SlimClient,
+        state: PlayerState,
+    ) -> None:
+        """After a flush (a seek or a new track) nothing plays until it starts."""
+        dummy_player.state = state
+        dummy_player.current_media = self._media(duration=265)  # type: ignore[misc]
+        dummy_player.awaiting_stream_start = True  # type: ignore[misc]
+
+        status = await self._status(dummy_server, dummy_player)
+
+        assert status["waitingToPlay"] == 1
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "state", [PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.STOPPED]
     )
