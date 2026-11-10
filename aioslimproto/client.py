@@ -271,6 +271,16 @@ class SlimClient:
         return self._current_media
 
     @property
+    def buffering_media(self) -> MediaDetails | None:
+        """Return the media(details) of the stream being started, if any."""
+        return self._buffering_media
+
+    @property
+    def awaiting_stream_start(self) -> bool:
+        """Return if a new stream was requested and has not started playing yet."""
+        return self._awaiting_stream_start
+
+    @property
     def next_media(self) -> MediaDetails | None:
         """Return the next/enqueued media(details), if any."""
         return self._next_media
