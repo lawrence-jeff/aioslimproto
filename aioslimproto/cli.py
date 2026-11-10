@@ -979,10 +979,15 @@ class SlimProtoCLI:
             "player_is_upgrading": 0,
             "power": int(player.powered),
             "signalstrength": 0,
-            # Only send waitingToPlay during buffering (as 1: the client treats 0 as true)
+            # Only send waitingToPlay while nothing is playing yet (as 1: the client treats 0
+            # as true). When the next track of a gapless handoff is requested the state is
+            # buffering, but the current track keeps playing out of the player's buffer, and
+            # a client that sees the flag stops moving its progress bar until the next track
+            # starts.
             **(
                 {"waitingToPlay": 1}
                 if player.state in (PlayerState.BUFFERING, PlayerState.BUFFER_READY)
+                and (player.awaiting_stream_start or not player.current_media)
                 else {}
             ),
         }
